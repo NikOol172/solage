@@ -1,2 +1,8 @@
 # solage
-A declarative GUI framework for Rust.  Build native Android, WebAssembly and Desktop applications using YAML layouts and Rhai scripting.  Powered by egui.
+
+Solage is a declarative GUI framework for Rust that allows you to build native Android, WebAssembly and Desktop applications using:
+- **YAML** for layout configuration
+- **Rhai** for logic scripting
+- **egui** for rendering
+
+Stay tuned for the first release!
