@@ -1,0 +1,34 @@
+[package]
+name = "solage_mobile"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# 1. On hérite des dépendances du workspace (donc compatible avec Desktop)
+solage_core = { workspace = true }
+solage_ui = { workspace = true }
+solage_data = { workspace = true }
+
+# 2. Dépendances spécifiques Android (Logging)
+log = "0.4"
+android_logger = "0.13"
+
+# 3. La trinité graphique pour Android (Doit matcher eframe 0.33)
+eframe = { version = "0.33", default-features = false, features = ["glow", "android-native-activity"] }
+winit = { version = "0.30", features = ["android-native-activity"] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+
+[package.metadata.android]
+package = "com.nhoule.solage" 
+label = "Solage"
+fullscreen = true
+target_sdk_version = 34 # Android 14
+min_sdk_version = 26    # Android 8.0
+icon = "@mipmap/ic_launcher" # Si vous avez mis une icône
+application_attributes = {"android:usesCleartextTraffic" = "true"}
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"

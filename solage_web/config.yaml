@@ -1,0 +1,98 @@
+title: "Solage 3.0 - Flavors Edition"
+version: "3.1"
+
+actions:
+  - label: "🖨️ Debug State"
+    script: |
+      // print("Etat actuel : " + show_name + " / FPS: " + fps);
+      print("Hello");
+
+  - label: "📁 Créer Dossiers"
+    script: |
+      // Exemple : mkdir /tmp/MyProject_shot010
+      let full_path = "/tmp/" + show_name + "_" + format;
+      print("Creation du dossier : " + full_path);
+      exec("mkdir -p " + full_path);
+
+  - label: "🚀 Lancer Process"
+    script: |
+      // print("Lancement fictif avec resolution " + res);
+      // Sous Linux, on lance xeyes pour l'exemple (si installé)
+      // Sous Windows, on pourrait lancer "calc.exe"
+      exec("xeyes");
+
+sections:
+  - name: "Global Settings"
+    icon: "⚙"
+    modes:
+      - name: "General"
+        flavors:
+          - name: "Default"
+            steps: ["Context"]
+            rows:
+              - key: "show_name"
+                label: "Show Name"
+                widget: { type: "text", default: "MyProject", validation: null }
+              - key: "fps"
+                label: "Frame Rate"
+                widget: { type: "number", min: 1, max: 120, default: 24, validation: null }
+
+  - name: "Assets"
+    icon: "📦"  
+    modes:
+      - name: "Modeling"
+        flavors:
+          - name: "Prop"
+            steps: ["Maya", "ZBrush"]
+            rows:
+              - key: "polycount"
+                label: "Max Polygons"
+                widget: { type: "number", min: 0, max: 50000, default: 10000, validation: "value < 50000" }
+              - key: "export_path"
+                label: "Export Folder"
+                widget: 
+                  type: "path"
+                  directory: true
+                  default: "/mnt/projects/assets"
+                  validation: null
+          
+          - name: "Character"
+            steps: ["Maya", "ZBrush", "Marvelous"]
+            rows:
+              - key: "uv_tiles"
+                label: "UV Tiles Count"
+                widget: { type: "number", min: 1, max: 100, default: 10, validation: null }
+              # Exemple de champ calculé
+              - key: "polycount"
+                label: "Max Polygons (Auto)"
+                widget: 
+                  type: "number" 
+                  min: 0 
+                  max: 1000000 
+                  default: 0 
+                  compute: "uv_tiles * 1000" 
+                  validation: null
+
+      - name: "Surfacing"
+        flavors:
+          - name: "Standard"
+            steps: ["Substance", "Mari"]
+            rows:
+              - key: "res"
+                label: "Resolution"
+                widget: { type: "number", min: 1024, max: 8192, default: 4096, validation: null }
+              # Exemple de Dropdown
+              - key: "format"
+                label: "File Format"
+                widget:
+                  type: "dropdown"
+                  options: ["exr", "png", "jpg", "tif"]
+                  default: "exr"
+                  validation: null
+              # Exemple de Booléen
+              - key: "udim"
+                label: "Use UDIMs?"
+                widget:
+                  type: "bool"
+                  default: false
+                  validation: null

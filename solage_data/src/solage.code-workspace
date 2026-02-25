@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../../python/solage"
+		},
+		{
+			"path": "../../../../perl/solage"
+		},
+		{
+			"path": "../../../../../www"
+		}
+	],
+	"settings": {}
+}

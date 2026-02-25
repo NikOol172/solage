@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "solage_data",
+    "solage_core",
+    "solage_ui",
+    "solage_desktop",
+    "solage_mobile",
+    "solage_web",
+]
+
+# Dépendances partagées (optionnel mais pratique pour garder les versions synchro)
+[workspace.dependencies]
+solage_data = { path = "./solage_data" }  # Pour que tout le monde puisse l'appeler
+solage_core = { path = "./solage_core" }
+solage_ui = { path = "./solage_ui" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+egui = "0.33" # Vérifiez la dernière version
+egui_extras = { version = "0.33", features = ["all_loaders"] } # Pour le TableBuilder (votre TreeView)
+rhai = "1.24"
+anyhow = "1.0"
+
+# Optimisations pour la version finale (Release)
+[profile.release]
+opt-level = "z"     # Optimiser pour la taille ("z" = size, "3" = vitesse max)
+lto = true          # Link Time Optimization (nettoie le code mort entre les crates)
+codegen-units = 1   # Compile tout en un seul bloc (plus lent, mais meilleur résultat)
+panic = "abort"     # Retire le code de gestion de "stack unwind" (gagne de la place)
+strip = true        # Retire les symboles de debug (réduit la taille de 80% !)

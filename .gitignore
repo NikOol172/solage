@@ -1,0 +1,17 @@
+# Fichiers de compilation Rust (TRÈS LOURDS)
+target/
+Cargo.lock
+runtime/
+
+# Fichiers de compilation Web (Trunk)
+dist/
+
+# Fichiers Python (si vous avez utilisé Flask)
+__pycache__/
+*.pyc
+venv/
+env/
+
+# Fichiers de base de données locaux (SQLite par exemple) ou secrets
+*.db
+.env

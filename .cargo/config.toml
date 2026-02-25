@@ -1,0 +1,12 @@
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-gcc-ar"
+
+# Indispensable pour que l'exe Windows fonctionne sans DLL manquantes
+rustflags = ["-C", "link-args=-static -static-libgcc -static-libstdc++"]
+
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "link-arg=-z", 
+    "-C", "link-arg=max-page-size=16384"
+]
