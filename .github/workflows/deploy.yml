@@ -37,10 +37,13 @@ jobs:
         with:
           version: 'latest'
 
+      - name: Installation de wasm-opt
+        run: sudo apt-get install binaryen
+
       - name: Compilation du projet
         # ATTENTION : Remplacez "solage-ams" par le nom exact de votre dépôt GitHub !
         # Le slash à la fin est obligatoire.
-        run: trunk build --release --public-url /solage/
+        run: trunk build --release --public-url /solage/solage_web/
 
       - name: Configuration de GitHub Pages
         uses: actions/configure-pages@v4
