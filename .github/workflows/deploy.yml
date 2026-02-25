@@ -1,0 +1,55 @@
+name: Deploy Web Version to GitHub Pages
+
+# Déclencheur : s'exécute à chaque push sur la branche principale
+on:
+  push:
+    branches: [ main ] # Modifiez par "master" si votre branche s'appelle master
+
+# Autorisations requises pour écrire sur GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# S'assure qu'un seul déploiement tourne à la fois
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+      
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Installation de Rust et WebAssembly
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Installation de Trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: 'latest'
+
+      - name: Compilation du projet
+        # ATTENTION : Remplacez "solage-ams" par le nom exact de votre dépôt GitHub !
+        # Le slash à la fin est obligatoire.
+        run: trunk build --release --public-url /solage/
+
+      - name: Configuration de GitHub Pages
+        uses: actions/configure-pages@v4
+
+      - name: Préparation des fichiers compilés (dossier dist)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './dist'
+
+      - name: Déploiement sur le Web !
+        id: deployment
+        uses: actions/deploy-pages@v4
