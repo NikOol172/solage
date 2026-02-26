@@ -1,3 +1,17 @@
+// Copyright [2026] [Nicolas Houle]
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+//     http://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use egui::{Ui, Color32, RichText, Visuals, Style, TextStyle, Stroke};
 use egui_extras::{TableBuilder, Column};
 use std::fs;
@@ -33,6 +47,12 @@ sections:
                 label: "Calcul (A * B)"
                 widget: { type: "text", compute: "A * B", default: "0" }
 "#;
+
+#[derive(serde::Deserialize, Debug)]
+pub struct AuthResponse {
+    pub status: String,
+    pub message: String,
+}
 
 #[derive(Default)]
 pub struct NavigationState {
@@ -173,20 +193,62 @@ impl SolageApp {
 
     // Nouvelle fonction pour lancer un téléchargement proprement
     fn fetch_url(&mut self, url: &str, ctx: &egui::Context) {
-        self.url_input = url.to_string(); // Met à jour le champ texte
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.download_rx = Some(rx);
-        let ctx_clone = ctx.clone();
+        // 1. Définissez l'URL de votre script Perl
+        let url = "http://localhost:8000/cgi-bin/api.cgi";
         
-        let request = ehttp::Request::get(url);
-        ehttp::fetch(request, move |response| {
-            let result = match response {
-                Ok(res) if res.ok => Ok(res.text().unwrap_or("").to_string()),
-                Ok(res) => Err(format!("Erreur {}: {}", res.status, res.status_text)),
-                Err(e) => Err(format!("Erreur réseau : {}", e)),
-            };
-            let _ = tx.send(result);
-            ctx_clone.request_repaint(); 
+        // 2. Préparez le contenu (body) à envoyer en format JSON
+        // (Assurez-vous d'avoir 'serde_json' dans vos dépendances)
+        let body = serde_json::json!({
+            "action": "connect",
+            // "utilisateur": self.username, (si vous avez des champs texte)
+            // "mot_de_passe": self.password,
+        }).to_string();
+
+        // 3. On construit la requête POST
+        let mut request = ehttp::Request::post(url, body.into_bytes());
+        request.headers = ehttp::headers(&[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/json"),
+        ]);
+
+        // 4. On clone le contexte
+        let ctx_clone = ctx.clone(); 
+        
+        // 5. On lance la requête
+        ehttp::fetch(request, move |result| {
+            match result {
+                Ok(response) => {
+                    if let Some(text) = response.text() {
+                        match serde_json::from_str::<AuthResponse>(text) {
+                            Ok(data) => {
+                                #[cfg(target_arch = "wasm32")]
+                                eframe::web_sys::console::log_1(&format!("Décodé : {:?}", data).into());
+                                #[cfg(not(target_arch = "wasm32"))]
+
+                                println!("Décodé : {:?}", data);
+                                // self.state.message = data.message; // Exemple de mise à jour
+                            },
+                            Err(e) => {
+                                #[cfg(target_arch = "wasm32")]
+                                eframe::web_sys::console::log_1(&format!("Erreur JSON : {}", e).into());
+
+                                #[cfg(not(target_arch = "wasm32"))]
+                                eprintln!("Erreur JSON : {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    #[cfg(target_arch = "wasm32")]
+                    eframe::web_sys::console::log_1(&format!("Erreur réseau : {}", e).into());
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    eprintln!("Erreur réseau : {}", e);
+                }
+            }
+            
+            // On force l'interface à se redessiner
+            ctx_clone.request_repaint();
         });
     }
 
@@ -344,16 +406,12 @@ impl eframe::App for SolageApp {
                                     self.login_rx = Some(rx);
                                     let ctx_clone = ctx.clone();
 
-                                    // 4. On construit la requête POST
-                                    let request = ehttp::Request {
-                                        method: "POST".to_string(),
-                                        url,
-                                        body: body.into_bytes(),
-                                        headers: ehttp::headers(&[
-                                            ("Content-Type", "application/json"),
-                                            ("Accept", "application/json"),
-                                        ]),
-                                    };
+                                    // 4. On construit la requête POST de manière robuste
+                                    let mut request = ehttp::Request::post(url, body.into_bytes());
+                                    request.headers = ehttp::headers(&[
+                                        ("Content-Type", "application/json"),
+                                        ("Accept", "application/json"),
+                                    ]);
 
                                     // 5. On envoie !
                                     ehttp::fetch(request, move |response| {
@@ -637,6 +695,60 @@ impl eframe::App for SolageApp {
                 self.toast = None;
             }
         }
+
+        // ==========================================
+        // --- 1. VISUEL DU GLISSER-DÉPOSER ---
+        // ==========================================
+        // Si un fichier survole actuellement la fenêtre de l'application
+        if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            egui::Area::new(egui::Id::new("drop_overlay"))
+                .order(egui::Order::Foreground) // Toujours par-dessus tout le reste
+                .show(ctx, |ui| {
+                    let rect = ctx.screen_rect(); // On prend toute la taille de l'écran
+                    
+                    // On dessine un fond sombre semi-transparent
+                    ui.painter().rect_filled(rect, egui::CornerRadius::same(0), Color32::from_black_alpha(190));
+                    
+                    // On centre le texte au milieu de l'écran
+                    ui.allocate_ui_at_rect(rect, |ui| {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(RichText::new("📂 Relâchez le fichier YAML ici").size(32.0).strong().color(Color32::WHITE));
+                        });
+                    });
+                });
+        }
+
+        // ==========================================
+        // --- 2. TRAITEMENT DU FICHIER DÉPOSÉ ---
+        // ==========================================
+        ctx.input(|i| {
+            // Si l'utilisateur vient de relâcher un fichier
+            if let Some(file) = i.raw.dropped_files.first() {
+                
+                // CAS A : Version Web (ou si le fichier est préchargé en mémoire)
+                if let Some(bytes) = &file.bytes {
+                    // On convertit les octets en texte
+                    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
+                        // On décode le YAML manuellement ici car on n'a pas de fichier physique
+                        match serde_yaml::from_str::<solage_data::AppConfig>(&text) {
+                            Ok(config) => {
+                                self.state.config = config;
+                                self.current_config_path = file.path.clone(); // Garde le nom virtuel (ex: "config.yaml")
+                                self.toast = Some(("✅ Fichier chargé depuis le navigateur !".to_string(), i.time));
+                            }
+                            Err(e) => {
+                                self.error_msg = Some(format!("Erreur YAML : {}", e));
+                            }
+                        }
+                    }
+                } 
+                // CAS B : Version Desktop (On a le vrai chemin du fichier sur le disque)
+                else if let Some(path) = &file.path {
+                    self.load_config_from_path(path);
+                    self.toast = Some(("✅ Fichier chargé depuis le bureau !".to_string(), i.time));
+                }
+            }
+        });
 
         #[cfg(not(target_os = "android"))]
         {

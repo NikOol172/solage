@@ -9,6 +9,14 @@ members = [
     "solage_web",
 ]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Votre Nom <cloudcompositing@gmail.com>"]
+description = "A declarative GUI framework for Rust using YAML and Rhai"
+repository = "https://github.com/NikOol172/solage"
+
 # Dépendances partagées (optionnel mais pratique pour garder les versions synchro)
 [workspace.dependencies]
 solage_data = { path = "./solage_data" }  # Pour que tout le monde puisse l'appeler
