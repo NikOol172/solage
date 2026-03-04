@@ -5,10 +5,14 @@ edition = "2024"
 
 [dependencies]
 solage_data = { workspace = true }
-serde = { workspace = true }
-serde_yaml = { workspace = true }
-serde_json = { workspace = true }
-rhai = { workspace = true } # Pour remplacer les "py:" strings
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+serde_yml   = { workspace = true }
+rhai        = { workspace = true }
+log         = { workspace = true }
+anyhow      = { workspace = true }
+ehttp       = { workspace = true }
+egui        = { workspace = true }
 
 # Dépendances exclusives à la version Web
 [target.'cfg(target_arch = "wasm32")'.dependencies]

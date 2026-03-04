@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // 1. LA RACINE (AppConfig)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -40,10 +41,23 @@ pub struct Mode {
 
 // 5. NIVEAU 3 : FLAVOR (ex: Default, Prop, Character)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RowDef {
+    pub key: String,
+    pub label: String,
+    pub widget: WidgetDef,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Step {
+    pub name: String,
+    pub values: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Flavor {
     pub name: String,
-    pub steps: Option<Vec<String>>, // ex: ["Maya", "ZBrush"]
-    pub rows: Vec<Row>,
+    pub row_definitions: Vec<RowDef>,
+    pub steps: Vec<Step>,
 }
 
 // 6. NIVEAU 4 : ROW (La ligne d'interface)
@@ -54,11 +68,25 @@ pub struct Row {
     pub widget: WidgetDef,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetType {
+    #[default]
+    Text,
+    Number,
+    Bool,
+    Checkbox,
+    Dropdown,
+    Path,
+    Slider,
+}
+
 // 7. LE WIDGET (Définition et Valeur)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WidgetDef {
+
     #[serde(rename = "type")]
-    pub widget_type: String, // "text", "number", "bool"...
+    pub widget_type: WidgetType,
 
     // Configuration YAML (Polyvalent : String, Number, Bool)
     // On utilise serde_json::Value pour accepter n'importe quoi du YAML
@@ -81,8 +109,8 @@ pub struct WidgetDef {
 impl WidgetDef {
     pub fn validation_rule(&self) -> Option<&str> {
         // CORRECTION 1 : On utilise 'self' au lieu de 'widget'
-        match self.widget_type.as_str() {
-            "text" | "text_input" => {
+        match self.widget_type {
+            WidgetType::Text => {
                 // On accède au champ validation de la structure
                 self.validation.as_deref()
             }
@@ -99,8 +127,6 @@ impl WidgetDef {
     }
 }
 
-// ... (Le reste du fichier s'il y a les préférences globales) ...
-// Si vous aviez ajouté GlobalPreferences précédemment, gardez-le en bas.
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct GlobalPreferences {
     pub recent_files: Vec<std::path::PathBuf>,
@@ -108,10 +134,14 @@ pub struct GlobalPreferences {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppState {
-    pub config: AppConfig, // Les données + La config
-    
-    // Navigation (On les rend publics pour que l'UI puisse les lire)
-    pub current_section_idx: usize,
-    pub current_mode_idx: usize,
-    pub current_flavor_idx: usize,
+    pub config: AppConfig,
+    pub nav: NavState,
+    pub prefs: GlobalPreferences,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NavState {
+    pub section: usize,
+    pub mode: usize,
+    pub flavor: usize,
 }

@@ -1,9 +1,14 @@
-pub use solage_data::*;
+// solage_core/src/lib.rs
+
 use rhai::{Engine, Scope}; 
 use std::collections::HashMap;
 use std::process::Command;
 use std::path::PathBuf;
 use std::fs;
+
+pub mod auth;
+pub use auth::{AuthProvider, AuthState, NoAuth};
+pub use solage_data::*;
 
 pub trait PlatformBackend {
     fn pick_file(&self) -> Option<PathBuf>;
@@ -13,8 +18,8 @@ pub trait PlatformBackend {
 }
 
 
-pub fn load_config(yaml_content: &str) -> Result<AppConfig, serde_yaml::Error> {
-    serde_yaml::from_str(yaml_content)
+pub fn load_config(yaml_content: &str) -> Result<AppConfig, serde_yml::Error> {
+    serde_yml::from_str(yaml_content)
 }
 
 // --- GESTION DE L'ÉTAT DU PROJET (VARIABLES, SLIDERS, ETC) ---

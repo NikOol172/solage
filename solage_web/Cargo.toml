@@ -1,18 +1,23 @@
+# solage_web/Cargo.toml
+
 [package]
 name = "solage_web"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]
-solage_core = { workspace = true }
-solage_ui = { workspace = true }
-solage_data = { workspace = true }
-
-# Dépendances Web
-eframe = { version = "0.33", default-features = false, features = ["glow"] }
-log = "0.4"
+solage_core  = { workspace = true }
+solage_ui    = { workspace = true }
+eframe       = { workspace = true }
+log          = { workspace = true }
 wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-console_error_panic_hook = "0.1.7"
+wasm-bindgen-futures      = "0.4"
+console_error_panic_hook  = "0.1"
+getrandom = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement"] }
-getrandom = { version = "0.3", features = ["wasm_js"] }

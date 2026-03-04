@@ -6,33 +6,12 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver};
 
-use solage_data::{AppConfig, WidgetDef, Section, Flavor, AppState, GlobalPreferences}; 
-use solage_core::{ScriptEngine, PlatformBackend, ScriptContext, load_config, load_state, save_state, save_preferences, load_preferences};
+use solage_data::{AppConfig, WidgetDef, Section, Flavor, AppState, GlobalPreferences, WidgetType as SolageWidget}; 
+use solage_core::{ScriptEngine, PlatformBackend, ScriptContext, AuthProvider, AuthState, NoAuth, load_config, load_state, save_state, save_preferences, load_preferences};
 
 mod viewer_3d;
 pub use viewer_3d::SceneCache;
 
-// Démo par défaut pour Android
-const ANDROID_DEMO_YAML: &str = r#"
-title: "Demo Android"
-sections:
-  - name: "Tests"
-    icon: "🚀"
-    modes:
-      - name: "Perf"
-        flavors: 
-          - name: "Fluidité"
-            rows:
-              - key: "A"
-                label: "Entrée A"
-                widget: { type: "number", default: "10" }
-              - key: "B"
-                label: "Entrée B"
-                widget: { type: "number", default: "5" }
-              - key: "Res"
-                label: "Calcul (A * B)"
-                widget: { type: "text", compute: "A * B", default: "0" }
-"#;
 
 #[derive(Default)]
 pub struct NavigationState {
@@ -51,6 +30,17 @@ impl NavigationState {
     }
 }
 
+struct LoginForm {
+    username: String,
+    password: String,
+}
+
+impl Default for LoginForm {
+    fn default() -> Self {
+        Self { username: String::new(), password: String::new() }
+    }
+}
+
 pub struct SolageApp {
     pub backend: Box<dyn PlatformBackend>,
     pub state: AppState,
@@ -62,19 +52,20 @@ pub struct SolageApp {
     nav_state: NavigationState,
     error_msg: Option<String>,
     prefs_path: String,
+    login_form: LoginForm,
+    auth: Box<dyn AuthProvider>,
     pub url_input: String,
     pub download_rx: Option<Receiver<Result<String, String>>>,
     pub toast: Option<(String, f64)>,
-    pub login_user: String,
-    pub login_pass: String,
-    pub auth_token: Option<String>,
-    pub login_msg: Option<String>,
-    pub login_rx: Option<Receiver<Result<String, String>>>,
     pub theme_applied: bool,
 }
 
 impl SolageApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, backend: Box<dyn PlatformBackend>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>, 
+        backend: Box<dyn PlatformBackend>,
+        auth: Box<dyn AuthProvider>,
+    ) -> Self {
         // 1. INSTALLATION DES LOADER D'IMAGES (CRUCIAL)
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
@@ -85,11 +76,13 @@ impl SolageApp {
 
         let mut app = Self {
             backend,
+            auth,
             state: AppState::default(),
             engine: ScriptEngine::new(),
             scene_cache: SceneCache::new(),
             preferences,
             nav_state: NavigationState::default(),
+            login_form: LoginForm::default(),
             config: None,
             current_config_path: None,
             error_msg: None,
@@ -97,11 +90,6 @@ impl SolageApp {
             url_input: "https://vacarmesvisuels.com/solage/configs/config.yaml".to_string(), // Mettez votre URL par défaut ici
             download_rx: None,
             toast: None,
-            login_user: String::new(),
-            login_pass: String::new(),
-            auth_token: None,
-            login_msg: None,
-            login_rx: None,
             theme_applied: false,
         };
 
@@ -178,7 +166,12 @@ impl SolageApp {
         self.download_rx = Some(rx);
         let ctx_clone = ctx.clone();
         
-        let request = ehttp::Request::get(url);
+        let body = serde_json::json!({
+            "username": self.login_form.username,
+            "password": self.login_form.password
+        }).to_string();
+
+        let request = ehttp::Request::post(url, body.into_bytes());
         ehttp::fetch(request, move |response| {
             let result = match response {
                 Ok(res) if res.ok => Ok(res.text().unwrap_or("").to_string()),
@@ -187,6 +180,42 @@ impl SolageApp {
             };
             let _ = tx.send(result);
             ctx_clone.request_repaint(); 
+        });
+    }
+
+    fn draw_login_screen(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.heading("Connexion");
+                ui.add_space(20.0);
+                
+                ui.horizontal(|ui| {
+                    ui.label("Utilisateur:");
+                    ui.text_edit_singleline(&mut self.login_form.username);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Mot de passe:");
+                    ui.add(egui::TextEdit::singleline(&mut self.login_form.password).password(true));
+                });
+                
+                ui.add_space(10.0);
+                
+                match self.auth.state() {
+                    AuthState::Pending => { ui.spinner(); },
+                    AuthState::Failed(msg) => { 
+                        ui.colored_label(Color32::RED, msg); 
+                    },
+                    _ => {}
+                }
+                
+                if ui.button("Se connecter").clicked() {
+                    self.auth.login(
+                        &self.login_form.username.clone(),
+                        &self.login_form.password.clone(),
+                        ctx,
+                    );
+                }
+            });
         });
     }
 
@@ -228,41 +257,20 @@ impl eframe::App for SolageApp {
             }
         }
 
-        // --- VÉRIFICATION DU LOGIN (Réponse du serveur) ---
-        if let Some(rx) = &self.login_rx {
-            // On regarde si une réponse est arrivée
-            if let Ok(result) = rx.try_recv() {
-                self.login_rx = None; // On arrête d'attendre
-                
-                match result {
-                    Ok(json_str) => {
-                        // On décode le JSON reçu de Perl
-                        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
-                        
-                        if v["status"] == "success" {
-                            // --- C'EST GAGNÉ ! ---
-                            let token = v["token"].as_str().unwrap_or_default().to_string();
-                            let username = v["user"]["username"].as_str().unwrap_or("Artiste");
-                            
-                            self.auth_token = Some(token);
-                            self.login_msg = None;
-                            
-                            // Petit toast de bienvenue sympa
-                            self.toast = Some((format!("👋 Bienvenue {}", username), ctx.input(|i| i.time)));
-                            
-                            // TODO PLUS TARD : Ici, on pourrait lancer automatiquement 
-                            // le téléchargement de la config "studio" par défaut.
-                        } else {
-                            // --- ÉCHEC (Mot de passe faux) ---
-                            let msg = v["message"].as_str().unwrap_or("Erreur inconnue");
-                            self.login_msg = Some(format!("❌ {}", msg));
-                        }
-                    },
-                    Err(e) => {
-                        self.login_msg = Some(format!("Erreur réseau : {}", e));
-                    }
-                }
+        // Poll auth (vérifie si une réponse est arrivée)
+        self.auth.poll();
+
+        // Affiche le toast de bienvenue au login
+        if let AuthState::LoggedIn { username, .. } = self.auth.state() {
+            if self.toast.is_none() {
+                // Premier frame après login
             }
+        }
+
+        // Écran d'accueil conditionnel sur l'auth
+        if !self.auth.is_ready() {
+            self.draw_login_screen(ctx);
+            return;
         }
 
         // --- SPLASH SCREEN (Desktop) ---
@@ -313,71 +321,22 @@ impl eframe::App for SolageApp {
                             
                             ui.horizontal(|ui| {
                                 ui.label("Utilisateur:     ");
-                                ui.add(egui::TextEdit::singleline(&mut self.login_user).desired_width(200.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.login_form.username).desired_width(200.0));
                             });
                             ui.add_space(5.0);
                             ui.horizontal(|ui| {
                                 ui.label("Mot de passe:");
-                                ui.add(egui::TextEdit::singleline(&mut self.login_pass).password(true).desired_width(200.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.login_form.password).password(true).desired_width(200.0));
                             });
                             
                             ui.add_space(15.0);
                             
-                            if self.login_rx.is_some() {
-                                ui.spinner();
-                            } else {
-                                if ui.add(egui::Button::new(RichText::new("Se connecter").size(16.0)).min_size(egui::vec2(200.0, 35.0))).clicked() {
-                                    self.login_msg = Some("Connexion en cours...".to_string());
-                                    
-                                    // 1. On prépare l'URL (Localhost pour le test)
-                                    // Note : Pour le mobile, il faudra mettre votre IP (ex: http://192.168.1.15:8000/...)
-                                    let url = "http://localhost:8000/cgi-bin/api.cgi".to_string();
-                                    
-                                    // 2. On prépare le JSON à envoyer
-                                    let body = serde_json::json!({
-                                        "username": self.login_user,
-                                        "password": self.login_pass
-                                    }).to_string();
-
-                                    // 3. On prépare le canal de communication (Thread -> UI)
-                                    let (tx, rx) = std::sync::mpsc::channel();
-                                    self.login_rx = Some(rx);
-                                    let ctx_clone = ctx.clone();
-
-                                    // 4. On construit la requête POST
-                                    let request = ehttp::Request {
-                                        method: "POST".to_string(),
-                                        url,
-                                        body: body.into_bytes(),
-                                        headers: ehttp::headers(&[
-                                            ("Content-Type", "application/json"),
-                                            ("Accept", "application/json"),
-                                        ]),
-                                    };
-
-                                    // 5. On envoie !
-                                    ehttp::fetch(request, move |response| {
-                                        let result = match response {
-                                            Ok(res) => {
-                                                if res.ok {
-                                                    Ok(res.text().unwrap_or("").to_string())
-                                                } else {
-                                                    Err(format!("Erreur Serveur {}: {}", res.status, res.status_text))
-                                                }
-                                            },
-                                            Err(e) => Err(format!("Échec connexion : {}", e)),
-                                        };
-                                        // On renvoie le résultat à l'interface principale
-                                        let _ = tx.send(result);
-                                        ctx_clone.request_repaint();
-                                    });
-                                }
-                            }
                             
-                            if let Some(msg) = &self.login_msg {
-                                ui.add_space(10.0);
-                                ui.colored_label(Color32::LIGHT_BLUE, msg);
-                            }
+                            
+                            // if let Some(msg) = &self.login_msg {
+                            //     ui.add_space(10.0);
+                            //     ui.colored_label(Color32::LIGHT_BLUE, msg);
+                            // }
                             ui.add_space(10.0);
                         });
                     });
@@ -480,11 +439,9 @@ impl eframe::App for SolageApp {
         for section in &self.state.config.sections {
             for mode in &section.modes {
                 for flavor in &mode.flavors {
-                    for row in &flavor.rows {
-                        if let Some(val) = &row.widget.value {
-                            global_map.insert(row.key.clone(), val.clone());
-                            let full_key = format!("{}.{}.{}.{}", section.name, mode.name, flavor.name, row.key);
-                            global_map.insert(full_key, val.clone());
+                    for step in &flavor.steps {
+                        for (key, val) in &step.values {
+                            global_map.insert(key.clone(), val.clone());
                         }
                     }
                 }
@@ -549,12 +506,12 @@ impl eframe::App for SolageApp {
         egui::SidePanel::left("sidebar").show(ctx, |ui| {
             ui.add_space(10.0);
             for (idx, section) in self.state.config.sections.iter().enumerate() {
-                let is_selected = self.state.current_section_idx == idx;
+                let is_selected = self.state.nav.section == idx;
                 let label = format!("{} {}", section.icon, section.name);
                 if ui.selectable_label(is_selected, label).clicked() {
-                    self.state.current_section_idx = idx;
-                    self.state.current_mode_idx = 0;
-                    self.state.current_flavor_idx = 0;
+                    self.state.nav.section = idx;
+                    self.state.nav.mode = 0;
+                    self.state.nav.flavor = 0;
                 }
             }
             ui.add_space(20.0);
@@ -570,35 +527,35 @@ impl eframe::App for SolageApp {
                 ui.colored_label(Color32::RED, format!("⚠ {}", err));
             }
 
-            let s_idx = self.state.current_section_idx;
+            let s_idx = self.state.nav.section;
             if let Some(active_section) = self.state.config.sections.get_mut(s_idx) {
                 ui.horizontal(|ui| {
                     for (m_idx, mode) in active_section.modes.iter().enumerate() {
-                        let is_sel = self.state.current_mode_idx == m_idx;
+                        let is_sel = self.state.nav.mode == m_idx;
                         if ui.selectable_label(is_sel, &mode.name).clicked() {
-                            self.state.current_mode_idx = m_idx;
-                            self.state.current_flavor_idx = 0;
+                            self.state.nav.mode = m_idx;
+                            self.state.nav.flavor = 0;
                         }
                     }
                 });
                 ui.separator();
 
-                let m_idx = self.state.current_mode_idx;
+                let m_idx = self.state.nav.mode;
                 if let Some(active_mode) = active_section.modes.get_mut(m_idx) {
                     ui.horizontal(|ui| {
                         ui.label("Variante :");
-                        let f_idx = self.state.current_flavor_idx;
+                        let f_idx = self.state.nav.flavor;
                         let current_name = active_mode.flavors.get(f_idx).map(|f| f.name.clone()).unwrap_or_default();
                         egui::ComboBox::from_id_salt("flav_cb")
                             .selected_text(current_name)
                             .show_ui(ui, |ui| {
                                 for (i, f) in active_mode.flavors.iter().enumerate() {
-                                    ui.selectable_value(&mut self.state.current_flavor_idx, i, &f.name);
+                                    ui.selectable_value(&mut self.state.nav.flavor, i, &f.name);
                                 }
                             });
                     });
                     
-                    let f_idx = self.state.current_flavor_idx;
+                    let f_idx = self.state.nav.flavor;
                     if let Some(active_flavor) = active_mode.flavors.get_mut(f_idx) {
                         draw_comparison_table(ui, active_flavor, &mut script_context, &self.engine, &self.backend);
                     }
@@ -687,21 +644,66 @@ fn draw_splash_anim(ctx: &egui::Context, time: f64) {
     });
 }
 
-fn draw_comparison_table(ui: &mut Ui, flavor: &mut Flavor, script_context: &mut ScriptContext, engine: &ScriptEngine, backend: &Box<dyn PlatformBackend>) {
-    let steps = flavor.steps.clone().unwrap_or_default();
-    if !steps.is_empty() {
-         ui.horizontal(|ui| { for step in &steps { ui.colored_label(Color32::LIGHT_BLUE, step); } });
+fn draw_comparison_table(
+    ui: &mut Ui, 
+    flavor: &mut Flavor, 
+    script_context: &mut ScriptContext, 
+    engine: &ScriptEngine, 
+    backend: &Box<dyn PlatformBackend>
+) {
+    if flavor.steps.is_empty() {
+        ui.colored_label(Color32::GRAY, "Aucun step défini");
+        return;
     }
-    TableBuilder::new(ui)
+
+    // Construction dynamique des colonnes
+    let mut builder = TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
-        .column(Column::initial(150.0)) 
-        .column(Column::remainder()) 
+        .column(Column::initial(150.0)); // Colonne "Label"
+
+    for _ in &flavor.steps {
+        builder = builder.column(Column::remainder());
+    }
+
+    builder
+        .header(30.0, |mut header| {
+            header.col(|ui| { 
+                ui.strong(RichText::new("Paramètre").color(Color32::WHITE)); 
+            });
+            for step in &flavor.steps {
+                header.col(|ui| { 
+                    ui.strong(RichText::new(&step.name).color(Color32::from_rgb(100, 180, 255))); 
+                });
+            }
+        })
         .body(|mut body| {
-            for row in &mut flavor.rows {
+            for row_def in &flavor.row_definitions {
                 body.row(24.0, |mut strip| {
-                    strip.col(|ui| { ui.label(&row.label); });
-                    strip.col(|ui| { draw_cell_widget(ui, &mut row.widget, script_context, engine, backend); });
+                    // Colonne label
+                    strip.col(|ui| { ui.label(&row_def.label); });
+
+                    // Une colonne par step
+                    for step in &mut flavor.steps {
+                        strip.col(|ui| {
+                            let value = step.values
+                                .entry(row_def.key.clone())
+                                .or_insert_with(|| {
+                                    // Valeur par défaut si absente
+                                    row_def.widget.default
+                                        .as_ref()
+                                        .map(|d| match d {
+                                            serde_json::Value::String(s) => s.clone(),
+                                            serde_json::Value::Number(n) => n.to_string(),
+                                            serde_json::Value::Bool(b) => b.to_string(),
+                                            _ => String::new(),
+                                        })
+                                        .unwrap_or_default()
+                                });
+
+                            draw_cell_value(ui, value, &row_def.widget, engine, backend);
+                        });
+                    }
                 });
             }
         });
@@ -715,71 +717,133 @@ fn draw_cell_widget(ui: &mut Ui, widget: &mut WidgetDef, ctx: &mut ScriptContext
         }
     }
     let value_ref = widget.value.as_mut().unwrap();
-    match widget.widget_type.as_str() {
-        "text" => { ui.text_edit_singleline(value_ref); },
-        "number" | "slider" => { 
+    match widget.widget_type {
+        SolageWidget::Text => { ui.text_edit_singleline(value_ref); },
+        SolageWidget::Number => {
             if let Ok(mut num) = value_ref.parse::<f32>() {
-                 let min = widget.min.unwrap_or(0.0);
-                 let max = widget.max.unwrap_or(100.0);
-                 if widget.widget_type == "slider" {
-                    if ui.add(egui::Slider::new(&mut num, min..=max)).changed() { *value_ref = num.to_string(); }
-                 } else {
-                    if ui.add(egui::DragValue::new(&mut num)).changed() { *value_ref = num.to_string(); }
-                 }
+                if ui.add(egui::DragValue::new(&mut num)).changed() { *value_ref = num.to_string(); }
             } else { ui.text_edit_singleline(value_ref); }
         },
-        "bool" | "checkbox" => {
+        SolageWidget::Slider => {
+            if let Ok(mut num) = value_ref.parse::<f32>() {
+                let min = widget.min.unwrap_or(0.0);
+                let max = widget.max.unwrap_or(100.0);
+                if ui.add(egui::Slider::new(&mut num, min..=max)).changed() { *value_ref = num.to_string(); }
+            }
+        },
+        SolageWidget::Bool | SolageWidget::Checkbox => {
             let mut b = value_ref.parse::<bool>().unwrap_or(false);
             if ui.checkbox(&mut b, "").changed() { *value_ref = b.to_string(); }
         },
-        "path" => {
-             ui.horizontal(|ui| {
+        SolageWidget::Path => {
+            ui.horizontal(|ui| {
                 ui.text_edit_singleline(value_ref);
                 if ui.button("📂").clicked() {
                     if let Some(p) = backend.pick_file() { *value_ref = p.display().to_string(); }
                 }
-             });
+            });
         },
-        // Support Image Viewer
-        "image_viewer" | "image" => {
-            if !value_ref.is_empty() {
-                let uri = format!("file://{}", value_ref);
-                ui.add(
-                    egui::Image::new(uri)
-                        .max_height(400.0)
-                        .fit_to_original_size(1.0)
-                        .maintain_aspect_ratio(true)
-                );
-            } else {
-                ui.colored_label(Color32::DARK_GRAY, "Aucune image");
+        SolageWidget::Dropdown => {
+            if let Some(options) = &widget.options {
+                let options = options.clone();
+                egui::ComboBox::from_id_salt("dropdown")
+                    .selected_text(value_ref.as_str())
+                    .show_ui(ui, |ui| {
+                        for opt in &options {
+                            ui.selectable_value(value_ref, opt.clone(), opt);
+                        }
+                    });
             }
         },
         _ => { ui.label(value_ref.as_str()); }
     }
 }
 
-fn apply_defaults(config: &AppConfig, state: &mut AppState) {
-    state.config = config.clone();
-    state.current_section_idx = 0;
-    for section in &mut state.config.sections {
-        for mode in &mut section.modes {
-            for flavor in &mut mode.flavors {
-                for row in &mut flavor.rows {
-                    if row.widget.value.is_none() {
-                         if let Some(def) = &row.widget.default {
-                             let s = match def {
-                                 serde_json::Value::String(s) => s.clone(),
-                                 serde_json::Value::Number(n) => n.to_string(),
-                                 serde_json::Value::Bool(b) => b.to_string(),
-                                 _ => String::new(),
-                             };
-                             row.widget.value = Some(s);
-                         }
-                    }
+fn draw_cell_value(
+    ui: &mut Ui,
+    value: &mut String,
+    widget: &WidgetDef,
+    engine: &ScriptEngine,
+    backend: &Box<dyn PlatformBackend>,
+) {
+    match widget.widget_type {
+        SolageWidget::Text => { ui.text_edit_singleline(value); },
+        SolageWidget::Number => {
+            if let Ok(mut num) = value.parse::<f32>() {
+                if ui.add(egui::DragValue::new(&mut num)).changed() {
+                    *value = num.to_string();
+                }
+            } else {
+                ui.text_edit_singleline(value);
+            }
+        },
+        SolageWidget::Slider => {
+            if let Ok(mut num) = value.parse::<f32>() {
+                let min = widget.min.unwrap_or(0.0);
+                let max = widget.max.unwrap_or(100.0);
+                if ui.add(egui::Slider::new(&mut num, min..=max)).changed() {
+                    *value = num.to_string();
                 }
             }
-        }
+        },
+        SolageWidget::Bool => {
+            let mut b = value.parse::<bool>().unwrap_or(false);
+            if ui.checkbox(&mut b, "").changed() {
+                *value = b.to_string();
+            }
+        },
+        SolageWidget::Path => {
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(value);
+                if ui.button("📂").clicked() {
+                    if let Some(p) = backend.pick_file() {
+                        *value = p.display().to_string();
+                    }
+                }
+            });
+        },
+        SolageWidget::Dropdown => {
+            if let Some(options) = &widget.options {
+                let options = options.clone();
+                egui::ComboBox::from_id_salt(&widget as *const _ as usize)
+                    .selected_text(value.as_str())
+                    .show_ui(ui, |ui| {
+                        for opt in &options {
+                            ui.selectable_value(value, opt.clone(), opt);
+                        }
+                    });
+            }
+        },
+        _ => { ui.label(value.as_str()); }
     }
+}
+
+fn apply_defaults(config: &AppConfig, state: &mut AppState) {
+    state.config = config.clone();
+    state.nav.section = 0;  // ← plus current_section_idx
+    state.nav.mode = 0;
+    state.nav.flavor = 0;
+    // for section in &mut state.config.sections {
+    //     for mode in &mut section.modes {
+    //         for flavor in &mut mode.flavors {
+    //             for step in &mut flavor.steps {
+    //                 for row in &mut step.rows {
+    //                     if row.widget.value.is_none() {
+    //                         if let Some(def) = &row.widget.default {
+    //                             let s = match def {
+    //                                 serde_json::Value::String(s) => s.clone(),
+    //                                 serde_json::Value::Number(n) => n.to_string(),
+    //                                 serde_json::Value::Bool(b) => b.to_string(),
+    //                                 _ => String::new(),
+    //                             };
+    //                             row.widget.value = Some(s);
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
 }
 
 // --- CHARTE GRAPHIQUE SOLAGE ---

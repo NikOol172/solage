@@ -1,0 +1,7 @@
+# solage_web/Trunk.toml
+
+[build]
+target = "index.html"
+
+[watch]
+ignore = []

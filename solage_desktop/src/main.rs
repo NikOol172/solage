@@ -1,5 +1,6 @@
 use eframe::egui;
 use solage_core::PlatformBackend;
+use solage_core::NoAuth;
 use solage_ui::SolageApp; // On a seulement besoin de ça !
 use std::process::Command;
 use std::path::PathBuf;
@@ -53,7 +54,7 @@ fn main() -> eframe::Result<()> {
             let backend = DesktopBackend; 
             
             // 2. On l'injecte dans l'application unifiée
-            Ok(Box::new(SolageApp::new(cc, Box::new(backend))))
+            Ok(Box::new(SolageApp::new(cc, Box::new(DesktopBackend), Box::new(NoAuth::new()))))
         }),
     )
 }

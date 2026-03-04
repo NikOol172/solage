@@ -6,11 +6,9 @@ edition = "2024"
 [dependencies]
 solage_data = { workspace = true }
 solage_core = { workspace = true }
-egui = { workspace = true }
-# Indispensable pour charger les JPG/PNG
-egui_extras = { version = "0.33", features = ["all_loaders"] } 
-egui_plot = "0.33"
-eframe = { version = "0.33", default-features = false, features = ["glow"] }
-log = "0.4"
-serde_json = { workspace = true }
-ehttp = "0.5.0"
+serde_json  = { workspace = true }
+egui        = { workspace = true }
+egui_extras = { workspace = true }
+eframe      = { workspace = true }
+ehttp       = { workspace = true }
+log         = { workspace = true }
