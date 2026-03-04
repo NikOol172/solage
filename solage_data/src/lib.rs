@@ -144,4 +144,5 @@ pub struct NavState {
     pub section: usize,
     pub mode: usize,
     pub flavor: usize,
+    pub step: usize,    // ← NOUVEAU
 }

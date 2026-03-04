@@ -49,11 +49,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Solage Desktop",
         native_options,
-        Box::new(|cc| {
-            // 1. On crée le backend Desktop
-            let backend = DesktopBackend; 
-            
-            // 2. On l'injecte dans l'application unifiée
+        Box::new(|cc| { 
             Ok(Box::new(SolageApp::new(cc, Box::new(DesktopBackend), Box::new(NoAuth::new()))))
         }),
     )

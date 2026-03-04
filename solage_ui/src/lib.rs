@@ -1,34 +1,16 @@
-use egui::{Ui, Color32, RichText, Visuals, Style, TextStyle, Stroke};
+use egui::{Ui, Color32, RichText, Visuals, TextStyle};
 use egui_extras::{TableBuilder, Column};
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::Receiver;
 
-use solage_data::{AppConfig, WidgetDef, Section, Flavor, AppState, GlobalPreferences, WidgetType as SolageWidget}; 
-use solage_core::{ScriptEngine, PlatformBackend, ScriptContext, AuthProvider, AuthState, NoAuth, load_config, load_state, save_state, save_preferences, load_preferences};
+use solage_data::{AppConfig, NavState, WidgetDef, Flavor, AppState, GlobalPreferences, WidgetType as SolageWidget}; 
+use solage_core::{ScriptEngine, PlatformBackend, ScriptContext, AuthProvider, AuthState, load_config, load_state, save_state, save_preferences, load_preferences};
 
 mod viewer_3d;
 pub use viewer_3d::SceneCache;
-
-
-#[derive(Default)]
-pub struct NavigationState {
-    pub active_section_idx: usize,
-    pub active_mode_indices: HashMap<usize, usize>, 
-    pub active_flavor_indices: HashMap<(usize, usize), usize>, 
-}
-
-impl NavigationState {
-    pub fn new() -> Self {
-        Self {
-            active_section_idx: 0,
-            active_mode_indices: HashMap::new(),
-            active_flavor_indices: HashMap::new(),
-        }
-    }
-}
 
 struct LoginForm {
     username: String,
@@ -49,7 +31,6 @@ pub struct SolageApp {
     pub preferences: GlobalPreferences,
     config: Option<AppConfig>, 
     current_config_path: Option<PathBuf>,
-    nav_state: NavigationState,
     error_msg: Option<String>,
     prefs_path: String,
     login_form: LoginForm,
@@ -74,20 +55,21 @@ impl SolageApp {
         let preferences = load_preferences(prefs_path.to_str().unwrap_or("user_prefs.json"))
             .unwrap_or_default();
 
-        let mut app = Self {
+        let default_url = backend.default_url().unwrap_or_default();
+
+        let app = Self {
             backend,
             auth,
+            url_input: default_url,
             state: AppState::default(),
             engine: ScriptEngine::new(),
             scene_cache: SceneCache::new(),
             preferences,
-            nav_state: NavigationState::default(),
             login_form: LoginForm::default(),
             config: None,
             current_config_path: None,
             error_msg: None,
             prefs_path: prefs_path.to_string_lossy().to_string(),
-            url_input: "https://vacarmesvisuels.com/solage/configs/config.yaml".to_string(), // Mettez votre URL par défaut ici
             download_rx: None,
             toast: None,
             theme_applied: false,
@@ -159,19 +141,13 @@ impl SolageApp {
         let _ = save_preferences(&self.prefs_path, &self.preferences);
     }
 
-    // Nouvelle fonction pour lancer un téléchargement proprement
     fn fetch_url(&mut self, url: &str, ctx: &egui::Context) {
-        self.url_input = url.to_string(); // Met à jour le champ texte
+        self.url_input = url.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         self.download_rx = Some(rx);
         let ctx_clone = ctx.clone();
         
-        let body = serde_json::json!({
-            "username": self.login_form.username,
-            "password": self.login_form.password
-        }).to_string();
-
-        let request = ehttp::Request::post(url, body.into_bytes());
+        let request = ehttp::Request::get(url);  // ← GET pas POST
         ehttp::fetch(request, move |response| {
             let result = match response {
                 Ok(res) if res.ok => Ok(res.text().unwrap_or("").to_string()),
@@ -224,6 +200,8 @@ impl SolageApp {
 impl eframe::App for SolageApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         
+        let is_mobile = ctx.content_rect().width() < 600.0;
+
         // NOUVEAU : Application du thème au premier lancement
         if !self.theme_applied {
             apply_studio_theme(ctx);
@@ -261,13 +239,14 @@ impl eframe::App for SolageApp {
         self.auth.poll();
 
         // Affiche le toast de bienvenue au login
-        if let AuthState::LoggedIn { username, .. } = self.auth.state() {
+        if let AuthState::LoggedIn { .. } = self.auth.state() {
             if self.toast.is_none() {
                 // Premier frame après login
             }
         }
 
         // Écran d'accueil conditionnel sur l'auth
+        log::info!("auth is_ready: {}", self.auth.is_ready());
         if !self.auth.is_ready() {
             self.draw_login_screen(ctx);
             return;
@@ -301,54 +280,14 @@ impl eframe::App for SolageApp {
                 ui.add_space(30.0);
                 ui.vertical_centered(|ui| {
                     ui.heading(RichText::new("SOLAGE").size(60.0).strong().color(Color32::from_rgb(100, 180, 255)));
-                    ui.label(RichText::new("Pipeline Manager & AMS").size(20.0).color(Color32::GRAY));
+                    ui.label(RichText::new("Pipeline Manager").size(20.0).color(Color32::GRAY));
                 });
                 ui.add_space(40.0);
 
-                // --- DIVISION EN DEUX COLONNES ---
-                ui.columns(2, |columns| {
-                    
-                    // ==========================================
-                    // COLONNE GAUCHE : CONNEXION STUDIO (AMS)
-                    // ==========================================
-                    columns[0].vertical_centered(|ui| {
-                        ui.heading(RichText::new("🏢 Connexion Studio").strong());
-                        ui.add_space(20.0);
-                        
-                        ui.group(|ui| {
-                            ui.set_width(300.0);
-                            ui.add_space(10.0);
-                            
-                            ui.horizontal(|ui| {
-                                ui.label("Utilisateur:     ");
-                                ui.add(egui::TextEdit::singleline(&mut self.login_form.username).desired_width(200.0));
-                            });
-                            ui.add_space(5.0);
-                            ui.horizontal(|ui| {
-                                ui.label("Mot de passe:");
-                                ui.add(egui::TextEdit::singleline(&mut self.login_form.password).password(true).desired_width(200.0));
-                            });
-                            
-                            ui.add_space(15.0);
-                            
-                            
-                            
-                            // if let Some(msg) = &self.login_msg {
-                            //     ui.add_space(10.0);
-                            //     ui.colored_label(Color32::LIGHT_BLUE, msg);
-                            // }
-                            ui.add_space(10.0);
-                        });
-                    });
-
-                    // ==========================================
-                    // COLONNE DROITE : MODE AUTONOME / VERSATILE
-                    // ==========================================
-                    columns[1].vertical_centered(|ui| {
-                        ui.heading(RichText::new("🛠️ Mode Autonome").strong());
-                        ui.add_space(20.0);
-                        
-                        // 1. Ouvrir Fichier Local
+                // Mode autonome (toujours visible si auth est prête)
+                ui.vertical_centered(|ui| {
+                    // 1. Ouvrir Fichier Local
+                    if !is_mobile {
                         let btn = egui::Button::new(RichText::new("📂 Ouvrir fichier local...").size(16.0))
                             .min_size(egui::vec2(300.0, 35.0));
                         if ui.add(btn).clicked() {
@@ -356,56 +295,55 @@ impl eframe::App for SolageApp {
                                 self.load_config_from_path(&path);
                             }
                         }
-
-                        // 2. Ouvrir URL Custom
                         ui.add_space(15.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(ui.available_width() / 2.0 - 150.0); // Centrage manuel
-                            ui.add(egui::TextEdit::singleline(&mut self.url_input).min_size(egui::vec2(220.0, 30.0)));
-                            if ui.add(egui::Button::new("⬇ URL").min_size(egui::vec2(70.0, 30.0))).clicked() {
-                                let url = self.url_input.clone();
-                                self.fetch_url(&url, ctx);
-                            }
-                        });
+                    }
 
-                        // 3. Fichiers Récents
-                        if !self.preferences.recent_files.is_empty() {
-                            ui.add_space(30.0);
-                            ui.separator();
-                            ui.add_space(10.0);
-                            ui.label(RichText::new("RÉCEMMENT OUVERTS").size(12.0).strong().color(Color32::GRAY));
-                            ui.add_space(10.0);
-
-                            // LA CORRECTION MAGIQUE EST ICI 👇
-                            // On clone la liste pour "libérer" self des emprunts immuables !
-                            let recent_files = self.preferences.recent_files.clone();
-
-                            for path in recent_files {
-                                let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-                                let full_path = path.to_string_lossy();
-                                
-                                ui.scope(|ui| {
-                                    ui.style_mut().visuals.widgets.inactive.weak_bg_fill = Color32::from_gray(30);
-                                    let btn = egui::Button::new(RichText::new(format!("📄 {}", file_name)).size(14.0))
-                                        .min_size(egui::vec2(280.0, 28.0)).frame(true);
-
-                                    if ui.add(btn).on_hover_text(full_path.to_string()).clicked() {
-                                        let path_str = full_path.to_string();
-                                        if path_str.starts_with("http") {
-                                            self.fetch_url(&path_str, ctx);
-                                        } else {
-                                            self.load_config_from_path(&path.clone()); // On clone le path aussi par sécurité
-                                        }
-                                    }
-                                });
-                                ui.add_space(5.0);
-                            }
+                    // 2. Ouvrir URL
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.url_input)
+                            .min_size(egui::vec2(220.0, 30.0)));
+                        if ui.add(egui::Button::new("⬇ URL")
+                            .min_size(egui::vec2(70.0, 30.0))).clicked() {
+                            let url = self.url_input.clone();
+                            self.fetch_url(&url, ctx);
                         }
                     });
+
+                    // 3. Fichiers Récents
+                    if !self.preferences.recent_files.is_empty() {
+                        ui.add_space(30.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("RÉCEMMENT OUVERTS").size(12.0).strong().color(Color32::GRAY));
+                        ui.add_space(10.0);
+
+                        let recent_files = self.preferences.recent_files.clone();
+                        for path in recent_files {
+                            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+                            let full_path = path.to_string_lossy();
+                            
+                            ui.scope(|ui| {
+                                ui.style_mut().visuals.widgets.inactive.weak_bg_fill = Color32::from_gray(30);
+                                let btn = egui::Button::new(
+                                    RichText::new(format!("📄 {}", file_name)).size(14.0))
+                                    .min_size(egui::vec2(280.0, 28.0))
+                                    .frame(true);
+
+                                if ui.add(btn).on_hover_text(full_path.to_string()).clicked() {
+                                    let path_str = full_path.to_string();
+                                    if path_str.starts_with("http") {
+                                        self.fetch_url(&path_str, ctx);
+                                    } else {
+                                        self.load_config_from_path(&path.clone());
+                                    }
+                                }
+                            });
+                            ui.add_space(5.0);
+                        }
+                    }
                 });
             });
 
-            // Overlay splash finissant
             #[cfg(not(target_os = "android"))]
             {
                 let time = ctx.input(|i| i.time);
@@ -503,24 +441,46 @@ impl eframe::App for SolageApp {
             });
         });
 
-        egui::SidePanel::left("sidebar").show(ctx, |ui| {
-            ui.add_space(10.0);
-            for (idx, section) in self.state.config.sections.iter().enumerate() {
-                let is_selected = self.state.nav.section == idx;
-                let label = format!("{} {}", section.icon, section.name);
-                if ui.selectable_label(is_selected, label).clicked() {
-                    self.state.nav.section = idx;
-                    self.state.nav.mode = 0;
-                    self.state.nav.flavor = 0;
+        if is_mobile {
+            // Sections en bas
+            egui::TopBottomPanel::bottom("mobile_nav").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let available = ui.available_width();
+                    let btn_width = available / self.state.config.sections.len() as f32;
+                    for (idx, section) in self.state.config.sections.iter().enumerate() {
+                        let is_selected = self.state.nav.section == idx;
+                        let label = format!("{}\n{}", section.icon, section.name);
+                        if ui.add_sized(
+                            [btn_width, 50.0],
+                            egui::Button::selectable(is_selected, RichText::new(&label).size(11.0))
+                        ).clicked() {
+                            self.state.nav.section = idx;
+                            self.state.nav.mode = 0;
+                            self.state.nav.flavor = 0;
+                        }
+                    }
+                });
+            });
+        } else {
+            egui::SidePanel::left("sidebar").show(ctx, |ui| {
+                ui.add_space(10.0);
+                for (idx, section) in self.state.config.sections.iter().enumerate() {
+                    let is_selected = self.state.nav.section == idx;
+                    let label = format!("{} {}", section.icon, section.name);
+                    if ui.selectable_label(is_selected, label).clicked() {
+                        self.state.nav.section = idx;
+                        self.state.nav.mode = 0;
+                        self.state.nav.flavor = 0;
+                    }
                 }
-            }
-            ui.add_space(20.0);
-            if ui.button("📂 Ouvrir autre...").clicked() {
-                if let Some(path) = self.backend.pick_file() {
-                    self.load_config_from_path(&path);
+                ui.add_space(20.0);
+                if ui.button("📂 Ouvrir autre...").clicked() {
+                    if let Some(path) = self.backend.pick_file() {
+                        self.load_config_from_path(&path);
+                    }
                 }
-            }
-        });
+            });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &self.error_msg {
@@ -557,7 +517,11 @@ impl eframe::App for SolageApp {
                     
                     let f_idx = self.state.nav.flavor;
                     if let Some(active_flavor) = active_mode.flavors.get_mut(f_idx) {
-                        draw_comparison_table(ui, active_flavor, &mut script_context, &self.engine, &self.backend);
+                        if is_mobile {
+                            draw_single_step(ui, active_flavor, &mut script_context, &self.engine, &self.backend, &mut self.state.nav);
+                        } else {
+                            draw_comparison_table(ui, active_flavor, &mut script_context, &self.engine, &self.backend);
+                        }
                     }
                 }
             }
@@ -580,7 +544,7 @@ impl eframe::App for SolageApp {
                         egui::Frame::popup(ui.style())
                             .fill(Color32::from_black_alpha((200.0 * alpha) as u8))
                             .stroke(egui::Stroke::NONE)
-                            .rounding(8.0)
+                            .corner_radius(8.0)
                             .inner_margin(12.0)
                             .show(ui, |ui| {
                                 ui.label(RichText::new(msg).color(Color32::from_white_alpha((255.0 * alpha) as u8)).strong().size(16.0));
@@ -617,7 +581,7 @@ fn draw_splash_anim(ctx: &egui::Context, time: f64) {
         let rect = ui.max_rect();
         ui.painter().rect_filled(
             rect, 
-            egui::Rounding::ZERO, 
+            egui::CornerRadius::ZERO, 
             egui::Color32::from_black_alpha((255.0 * fade_out) as u8)
         );
 
@@ -644,10 +608,64 @@ fn draw_splash_anim(ctx: &egui::Context, time: f64) {
     });
 }
 
+fn draw_single_step(
+    ui: &mut Ui,
+    flavor: &mut Flavor,
+    _script_context: &mut ScriptContext,
+    engine: &ScriptEngine,
+    backend: &Box<dyn PlatformBackend>,
+    nav: &mut NavState,
+) {
+    if flavor.steps.is_empty() {
+        ui.colored_label(Color32::GRAY, "Aucun step défini");
+        return;
+    }
+
+    // Navigation entre steps
+    let step_count = flavor.steps.len();
+    let current = nav.step.min(step_count - 1);
+
+    ui.horizontal(|ui| {
+        if ui.button("◀").clicked() && current > 0 {
+            nav.step -= 1;
+        }
+        ui.strong(RichText::new(&flavor.steps[current].name)
+            .size(16.0)
+            .color(Color32::from_rgb(100, 180, 255)));
+        if ui.button("▶").clicked() && current < step_count - 1 {
+            nav.step += 1;
+        }
+        ui.label(format!("{}/{}", current + 1, step_count));
+    });
+    ui.separator();
+
+    // Affichage des rows du step courant
+    let step = &mut flavor.steps[current];
+    for row_def in &flavor.row_definitions {
+        ui.horizontal(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(&row_def.label);
+            let value = step.values
+                .entry(row_def.key.clone())
+                .or_insert_with(|| {
+                    row_def.widget.default.as_ref()
+                        .map(|d| match d {
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Number(n) => n.to_string(),
+                            serde_json::Value::Bool(b) => b.to_string(),
+                            _ => String::new(),
+                        })
+                        .unwrap_or_default()
+                });
+            draw_cell_value(ui, value, &row_def.widget, engine, backend);
+        });
+    }
+}
+
 fn draw_comparison_table(
     ui: &mut Ui, 
     flavor: &mut Flavor, 
-    script_context: &mut ScriptContext, 
+    _script_context: &mut ScriptContext, 
     engine: &ScriptEngine, 
     backend: &Box<dyn PlatformBackend>
 ) {
@@ -709,61 +727,11 @@ fn draw_comparison_table(
         });
 }
 
-fn draw_cell_widget(ui: &mut Ui, widget: &mut WidgetDef, ctx: &mut ScriptContext, engine: &ScriptEngine, backend: &Box<dyn PlatformBackend>) {
-    if widget.value.is_none() { widget.value = Some("".to_string()); }
-    if let Some(rule) = widget.compute_rule() {
-        if let Some(result) = engine.eval_with_context(rule, ctx, widget.value.as_deref()) {
-            widget.value = Some(result);
-        }
-    }
-    let value_ref = widget.value.as_mut().unwrap();
-    match widget.widget_type {
-        SolageWidget::Text => { ui.text_edit_singleline(value_ref); },
-        SolageWidget::Number => {
-            if let Ok(mut num) = value_ref.parse::<f32>() {
-                if ui.add(egui::DragValue::new(&mut num)).changed() { *value_ref = num.to_string(); }
-            } else { ui.text_edit_singleline(value_ref); }
-        },
-        SolageWidget::Slider => {
-            if let Ok(mut num) = value_ref.parse::<f32>() {
-                let min = widget.min.unwrap_or(0.0);
-                let max = widget.max.unwrap_or(100.0);
-                if ui.add(egui::Slider::new(&mut num, min..=max)).changed() { *value_ref = num.to_string(); }
-            }
-        },
-        SolageWidget::Bool | SolageWidget::Checkbox => {
-            let mut b = value_ref.parse::<bool>().unwrap_or(false);
-            if ui.checkbox(&mut b, "").changed() { *value_ref = b.to_string(); }
-        },
-        SolageWidget::Path => {
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(value_ref);
-                if ui.button("📂").clicked() {
-                    if let Some(p) = backend.pick_file() { *value_ref = p.display().to_string(); }
-                }
-            });
-        },
-        SolageWidget::Dropdown => {
-            if let Some(options) = &widget.options {
-                let options = options.clone();
-                egui::ComboBox::from_id_salt("dropdown")
-                    .selected_text(value_ref.as_str())
-                    .show_ui(ui, |ui| {
-                        for opt in &options {
-                            ui.selectable_value(value_ref, opt.clone(), opt);
-                        }
-                    });
-            }
-        },
-        _ => { ui.label(value_ref.as_str()); }
-    }
-}
-
 fn draw_cell_value(
     ui: &mut Ui,
     value: &mut String,
     widget: &WidgetDef,
-    engine: &ScriptEngine,
+    _engine: &ScriptEngine,
     backend: &Box<dyn PlatformBackend>,
 ) {
     match widget.widget_type {

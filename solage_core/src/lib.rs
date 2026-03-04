@@ -4,7 +4,6 @@ use rhai::{Engine, Scope};
 use std::collections::HashMap;
 use std::process::Command;
 use std::path::PathBuf;
-use std::fs;
 
 pub mod auth;
 pub use auth::{AuthProvider, AuthState, NoAuth};
@@ -15,6 +14,7 @@ pub trait PlatformBackend {
     fn save_file(&self, path: &PathBuf, content: &str) -> Result<(), String>;
     fn launch_external(&self, command: &str, args: &[&str]) -> Result<(), String>;
     fn get_config_dir(&self) -> PathBuf;
+    fn default_url(&self) -> Option<String> { None }
 }
 
 

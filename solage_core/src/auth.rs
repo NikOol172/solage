@@ -1,7 +1,5 @@
 // solage_core/src/auth.rs
 
-use egui::Context;
-
 #[derive(Debug, Clone)]
 pub enum AuthState {
     LoggedOut,
