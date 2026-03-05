@@ -1,4 +1,4 @@
-use solage_core::PlatformBackend;
+use solage_core::{PlatformBackend, NoAuth};
 use solage_ui::SolageApp;
 use std::path::PathBuf;
 
@@ -77,9 +77,14 @@ fn android_main(app: AndroidApp) {
         .unwrap_or_else(|| PathBuf::from("/data/local/tmp"));
 
     let options = eframe::NativeOptions {
-        android_app: Some(app),
+        android_app: Some(app.clone()),
         ..Default::default()
     };
+
+    app.set_window_flags(
+        android_activity::WindowManagerFlags::KEEP_SCREEN_ON,
+        android_activity::WindowManagerFlags::empty(),
+    );
 
     eframe::run_native(
         "Solage Mobile",
@@ -89,7 +94,7 @@ fn android_main(app: AndroidApp) {
             let backend = MobileBackend { data_dir };
             
             // B. On initialise l'UI commune avec ce backend
-            let mut solage_app = SolageApp::new(cc, Box::new(backend));
+            let mut solage_app = SolageApp::new(cc, Box::new(backend), Box::new(NoAuth::new()));
             
             // C. CRUCIAL : On injecte la config de démo immédiatement !
             // Comme on n'a pas de bouton "Ouvrir", il faut que l'app se lance avec du contenu.

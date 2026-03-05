@@ -299,14 +299,16 @@ impl eframe::App for SolageApp {
                     }
 
                     // 2. Ouvrir URL
-                    ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.url_input)
-                            .min_size(egui::vec2(220.0, 30.0)));
-                        if ui.add(egui::Button::new("⬇ URL")
-                            .min_size(egui::vec2(70.0, 30.0))).clicked() {
-                            let url = self.url_input.clone();
-                            self.fetch_url(&url, ctx);
-                        }
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.url_input)
+                                .desired_width(220.0));
+                            if ui.add(egui::Button::new("⬇ URL")
+                                .min_size(egui::vec2(70.0, 30.0))).clicked() {
+                                let url = self.url_input.clone();
+                                self.fetch_url(&url, ctx);
+                            }
+                        });
                     });
 
                     // 3. Fichiers Récents
