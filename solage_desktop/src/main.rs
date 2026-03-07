@@ -1,17 +1,23 @@
 use eframe::egui;
 use solage_core::PlatformBackend;
 use solage_core::NoAuth;
-use solage_ui::SolageApp; // On a seulement besoin de ça !
+use solage_ui::SolageApp;
 use std::process::Command;
 use std::path::PathBuf;
 
-// 1. On crée la structure pour le Desktop
 struct DesktopBackend;
 
-// 2. On implémente le contrat avec les vrais outils système (Windows/Linux/Mac)
 impl PlatformBackend for DesktopBackend {
     fn pick_file(&self) -> Option<PathBuf> {
-        rfd::FileDialog::new().pick_file() // Utilise la boite de dialogue native
+        rfd::FileDialog::new().pick_file()
+    }
+
+    fn pick_file_async(&self, tx: std::sync::mpsc::Sender<PathBuf>) {
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                let _ = tx.send(path);
+            }
+        });
     }
 
     fn save_file(&self, path: &PathBuf, content: &str) -> Result<(), String> {
@@ -32,15 +38,9 @@ impl PlatformBackend for DesktopBackend {
 }
 
 fn main() -> eframe::Result<()> {
-    // Configuration pour Linux (Wayland/X11)
-    unsafe {
-        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
-        std::env::remove_var("WAYLAND_DISPLAY"); 
-    }
     env_logger::init();
 
     let native_options = eframe::NativeOptions {
-        // Optionnel : Définir la taille de départ
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0]),
         ..Default::default()

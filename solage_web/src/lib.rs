@@ -8,8 +8,6 @@ use std::path::PathBuf;
 #[cfg(target_arch = "wasm32")]
 use solage_core::PlatformBackend;
 
-
-
 #[cfg(target_arch = "wasm32")]
 struct WebBackend;
 

@@ -9,9 +9,6 @@ use std::sync::mpsc::Receiver;
 use solage_data::{AppConfig, NavState, WidgetDef, Flavor, AppState, GlobalPreferences, WidgetType as SolageWidget}; 
 use solage_core::{ScriptEngine, PlatformBackend, ScriptContext, AuthProvider, AuthState, load_config, load_state, save_state, save_preferences, load_preferences};
 
-mod viewer_3d;
-pub use viewer_3d::SceneCache;
-
 struct LoginForm {
     username: String,
     password: String,
@@ -27,7 +24,6 @@ pub struct SolageApp {
     pub backend: Box<dyn PlatformBackend>,
     pub state: AppState,
     pub engine: ScriptEngine,
-    pub scene_cache: SceneCache,
     pub preferences: GlobalPreferences,
     config: Option<AppConfig>, 
     current_config_path: Option<PathBuf>,
@@ -37,6 +33,7 @@ pub struct SolageApp {
     auth: Box<dyn AuthProvider>,
     pub url_input: String,
     pub download_rx: Option<Receiver<Result<String, String>>>,
+    pub file_load_rx: Option<Receiver<PathBuf>>,
     pub toast: Option<(String, f64)>,
     pub theme_applied: bool,
 }
@@ -47,10 +44,8 @@ impl SolageApp {
         backend: Box<dyn PlatformBackend>,
         auth: Box<dyn AuthProvider>,
     ) -> Self {
-        // 1. INSTALLATION DES LOADER D'IMAGES (CRUCIAL)
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
-        // 2. Chargement des préférences
         let prefs_path = backend.get_config_dir().join("user_prefs.json");
         let preferences = load_preferences(prefs_path.to_str().unwrap_or("user_prefs.json"))
             .unwrap_or_default();
@@ -63,7 +58,6 @@ impl SolageApp {
             url_input: default_url,
             state: AppState::default(),
             engine: ScriptEngine::new(),
-            scene_cache: SceneCache::new(),
             preferences,
             login_form: LoginForm::default(),
             config: None,
@@ -71,14 +65,11 @@ impl SolageApp {
             error_msg: None,
             prefs_path: prefs_path.to_string_lossy().to_string(),
             download_rx: None,
+            file_load_rx: None,
             toast: None,
             theme_applied: false,
         };
 
-        // #[cfg(target_os = "android")]
-        // {
-        //     app.load_yaml_string(ANDROID_DEMO_YAML);
-        // }
         app
     }
 
@@ -89,7 +80,6 @@ impl SolageApp {
         }
     }
 
-    // Chargement robuste avec capture d'erreurs
     fn load_config_from_path(&mut self, path: &Path) {
         log::info!("Lecture du fichier : {:?}", path);
 
@@ -147,7 +137,7 @@ impl SolageApp {
         self.download_rx = Some(rx);
         let ctx_clone = ctx.clone();
         
-        let request = ehttp::Request::get(url);  // ← GET pas POST
+        let request = ehttp::Request::get(url);
         ehttp::fetch(request, move |response| {
             let result = match response {
                 Ok(res) if res.ok => Ok(res.text().unwrap_or("").to_string()),
@@ -202,7 +192,6 @@ impl eframe::App for SolageApp {
         
         let is_mobile = ctx.content_rect().width() < 600.0;
 
-        // NOUVEAU : Application du thème au premier lancement
         if !self.theme_applied {
             apply_studio_theme(ctx);
             self.theme_applied = true;
@@ -216,15 +205,11 @@ impl eframe::App for SolageApp {
                         self.load_yaml_string(&yaml);
                         
                         if self.error_msg.is_none() {
-                            // 1. On sauvegarde dans les récents
                             let url_path = PathBuf::from(&self.url_input);
                             self.add_to_recents(url_path.clone());
                             
-                            // 2. CRUCIAL : On dit à l'app que ce fichier est notre fichier "actuel"
                             self.current_config_path = Some(url_path);
                             
-                            // 3. On tente de restaurer les variables (sliders, cases cochées...)
-                            // depuis le LocalStorage en utilisant l'URL comme clé.
                             if let Ok(saved_state) = load_state(&self.url_input) {
                                 self.state = saved_state;
                             }
@@ -235,24 +220,26 @@ impl eframe::App for SolageApp {
             }
         }
 
-        // Poll auth (vérifie si une réponse est arrivée)
-        self.auth.poll();
-
-        // Affiche le toast de bienvenue au login
-        if let AuthState::LoggedIn { .. } = self.auth.state() {
-            if self.toast.is_none() {
-                // Premier frame après login
+        if let Some(rx) = &self.file_load_rx {
+            if let Ok(path) = rx.try_recv() {
+                self.load_config_from_path(&path);
+                self.file_load_rx = None; // On vide le canal
             }
         }
 
-        // Écran d'accueil conditionnel sur l'auth
+        self.auth.poll();
+
+        if let AuthState::LoggedIn { .. } = self.auth.state() {
+            if self.toast.is_none() {
+            }
+        }
+
         log::info!("auth is_ready: {}", self.auth.is_ready());
         if !self.auth.is_ready() {
             self.draw_login_screen(ctx);
             return;
         }
 
-        // --- SPLASH SCREEN (Desktop) ---
         #[cfg(not(target_os = "android"))] 
         {
             let time = ctx.input(|i| i.time);
@@ -265,7 +252,6 @@ impl eframe::App for SolageApp {
             }
         }
 
-        // --- 1. MODE "ACCUEIL" (Si aucune config chargée) ---
         if self.state.config.sections.is_empty() {
             egui::CentralPanel::default().show(ctx, |ui| {
                 
@@ -284,21 +270,18 @@ impl eframe::App for SolageApp {
                 });
                 ui.add_space(40.0);
 
-                // Mode autonome (toujours visible si auth est prête)
                 ui.vertical_centered(|ui| {
-                    // 1. Ouvrir Fichier Local
                     if !is_mobile {
                         let btn = egui::Button::new(RichText::new("📂 Ouvrir fichier local...").size(16.0))
                             .min_size(egui::vec2(300.0, 35.0));
                         if ui.add(btn).clicked() {
-                            if let Some(path) = self.backend.pick_file() {
-                                self.load_config_from_path(&path);
-                            }
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.file_load_rx = Some(rx);
+                            self.backend.pick_file_async(tx);
                         }
                         ui.add_space(15.0);
                     }
 
-                    // 2. Ouvrir URL
                     ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut self.url_input)
@@ -311,7 +294,6 @@ impl eframe::App for SolageApp {
                         });
                     });
 
-                    // 3. Fichiers Récents
                     if !self.preferences.recent_files.is_empty() {
                         ui.add_space(30.0);
                         ui.separator();
@@ -357,9 +339,6 @@ impl eframe::App for SolageApp {
             return;
         }
 
-        // --- 2. INTERFACE PRINCIPALE ---
-
-        // --- NOUVEAU : RACCOURCI CLAVIER (Ctrl+S / Cmd+S) ---
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             if let Some(path) = &self.current_config_path {
                 let path_str = path.to_string_lossy().to_string();
@@ -374,7 +353,6 @@ impl eframe::App for SolageApp {
             }
         }
         
-        // Optimisation Context
         let mut global_map = HashMap::new();
         for section in &self.state.config.sections {
             for mode in &section.modes {
@@ -394,26 +372,21 @@ impl eframe::App for SolageApp {
                 ui.heading("Solage");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     
-                    // --- BOUTON FERMER (AVEC AUTO-SAVE) ---
                     if ui.button("Fermer Projet").clicked() {
                         if let Some(path) = &self.current_config_path {
                             let path_str = path.to_string_lossy().to_string();
-                            // Si c'est une URL on utilise l'URL, sinon on crée un fichier .json
                             let state_path = if path_str.starts_with("http") {
                                 path_str
                             } else {
                                 path.with_extension("json").to_string_lossy().to_string()
                             };
-                            // On sauvegarde automatiquement !
                             let _ = save_state(&state_path, &self.state);
                         }
                         
-                        // Puis on nettoie l'interface pour revenir à l'accueil
                         self.state.config.sections.clear();
                         self.current_config_path = None;
                     }
 
-                    // --- BOUTON SAUVEGARDER MANUEL ---
                     if ui.button("💾 Save").clicked() {
                         if let Some(path) = &self.current_config_path {
                             let path_str = path.to_string_lossy().to_string();
@@ -444,7 +417,6 @@ impl eframe::App for SolageApp {
         });
 
         if is_mobile {
-            // Sections en bas
             egui::TopBottomPanel::bottom("mobile_nav").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let available = ui.available_width();
@@ -533,16 +505,13 @@ impl eframe::App for SolageApp {
             let current_time = ctx.input(|i| i.time);
             let elapsed = current_time - start_time;
             
-            // On l'affiche pendant 2.5 secondes
             if elapsed < 2.5 {
-                // Calcul du fondu (fade out) sur la dernière demi-seconde
                 let alpha = if elapsed > 2.0 { 1.0 - ((elapsed - 2.0) * 2.0) as f32 } else { 1.0 };
                 
                 egui::Area::new(egui::Id::new("toast_area"))
-                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0)) // En bas au centre
-                    .order(egui::Order::Foreground) // Toujours au premier plan
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
+                    .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
-                        // Un joli cadre sombre aux bords arrondis
                         egui::Frame::popup(ui.style())
                             .fill(Color32::from_black_alpha((200.0 * alpha) as u8))
                             .stroke(egui::Stroke::NONE)
@@ -553,10 +522,8 @@ impl eframe::App for SolageApp {
                             });
                     });
                 
-                // On demande à egui de redessiner l'écran à la prochaine frame pour que l'animation soit fluide
                 ctx.request_repaint();
             } else {
-                // Le temps est écoulé, on supprime le toast
                 self.toast = None;
             }
         }
@@ -572,9 +539,6 @@ impl eframe::App for SolageApp {
     }
 
 }
-
-// --- HELPER FUNCTIONS ---
-
 
 fn draw_splash_anim(ctx: &egui::Context, time: f64) {
     let fade_out = if time > 1.5 { (2.5 - time).clamp(0.0, 1.0) as f32 } else { 1.0 };
@@ -623,7 +587,6 @@ fn draw_single_step(
         return;
     }
 
-    // Navigation entre steps
     let step_count = flavor.steps.len();
     let current = nav.step.min(step_count - 1);
 
@@ -641,7 +604,6 @@ fn draw_single_step(
     });
     ui.separator();
 
-    // Affichage des rows du step courant
     let step = &mut flavor.steps[current];
     for row_def in &flavor.row_definitions {
         ui.horizontal(|ui| {
@@ -676,11 +638,10 @@ fn draw_comparison_table(
         return;
     }
 
-    // Construction dynamique des colonnes
     let mut builder = TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
-        .column(Column::initial(150.0)); // Colonne "Label"
+        .column(Column::initial(150.0));
 
     for _ in &flavor.steps {
         builder = builder.column(Column::remainder());
@@ -709,7 +670,6 @@ fn draw_comparison_table(
                             let value = step.values
                                 .entry(row_def.key.clone())
                                 .or_insert_with(|| {
-                                    // Valeur par défaut si absente
                                     row_def.widget.default
                                         .as_ref()
                                         .map(|d| match d {
@@ -790,82 +750,48 @@ fn draw_cell_value(
 
 fn apply_defaults(config: &AppConfig, state: &mut AppState) {
     state.config = config.clone();
-    state.nav.section = 0;  // ← plus current_section_idx
+    state.nav.section = 0;
     state.nav.mode = 0;
     state.nav.flavor = 0;
-    // for section in &mut state.config.sections {
-    //     for mode in &mut section.modes {
-    //         for flavor in &mut mode.flavors {
-    //             for step in &mut flavor.steps {
-    //                 for row in &mut step.rows {
-    //                     if row.widget.value.is_none() {
-    //                         if let Some(def) = &row.widget.default {
-    //                             let s = match def {
-    //                                 serde_json::Value::String(s) => s.clone(),
-    //                                 serde_json::Value::Number(n) => n.to_string(),
-    //                                 serde_json::Value::Bool(b) => b.to_string(),
-    //                                 _ => String::new(),
-    //                             };
-    //                             row.widget.value = Some(s);
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
 }
 
-// --- CHARTE GRAPHIQUE SOLAGE ---
 pub fn apply_studio_theme(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     
-    // On charge le fichier TTF directement dans le binaire compilé
     fonts.font_data.insert(
         "StudioFont".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/font.ttf"))), // ✅ Enveloppé dans un Arc
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/font.ttf"))), 
     );
 
-    // On ordonne à egui d'utiliser cette police en priorité absolue pour le texte proportionnel (normal)
     fonts.families
         .entry(egui::FontFamily::Proportional)
         .or_default()
         .insert(0, "StudioFont".to_owned());
-
-    // On applique les nouvelles polices au contexte
     ctx.set_fonts(fonts);
 
-    // 1. On part sur une base sombre
     let mut visuals = Visuals::dark();
     
-    // 2. Couleurs de fond (Gris anthracite bleuté, très pro)
     visuals.window_fill = Color32::from_rgb(25, 27, 31);
     visuals.panel_fill = Color32::from_rgb(18, 20, 24);
     
-    // 3. Couleur d'accentuation (Le "Bleu Solage" pour les sélections et sliders)
     let solage_blue = Color32::from_rgb(100, 180, 255);
-    let dark_text = Color32::from_rgb(20, 22, 25); // Un gris presque noir, très élégant
+    let dark_text = Color32::from_rgb(20, 22, 25);
 
     visuals.selection.bg_fill = solage_blue;
-    // On force le texte à l'intérieur des zones sélectionnées à être sombre
     visuals.selection.stroke = egui::Stroke::new(1.0, dark_text); 
     
-    // On s'assure aussi que quand on clique (état "actif"), le texte reste lisible
     visuals.widgets.active.bg_fill = solage_blue;
     visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, dark_text);
     
-    // 4. Arrondir les angles (Design plus moderne, moins rigide)
-    let radius = egui::CornerRadius::same(6); // On utilise CornerRadius au lieu de Rounding
+    let radius = egui::CornerRadius::same(6);
     visuals.widgets.noninteractive.corner_radius = radius;
     visuals.widgets.inactive.corner_radius = radius;
     visuals.widgets.hovered.corner_radius = radius;
     visuals.widgets.active.corner_radius = radius;
-    visuals.window_corner_radius = egui::CornerRadius::same(10); // Les fenêtres flottantes plus arrondies
+    visuals.window_corner_radius = egui::CornerRadius::same(10);
     
-    // 5. Appliquer les couleurs au contexte
     ctx.set_visuals(visuals);
 
-    // 6. Ajustement global des textes (Un peu plus grands et lisibles)
     let mut style = (*ctx.style()).clone();
     
     style.text_styles.insert(TextStyle::Body, egui::FontId::proportional(15.0));
@@ -873,10 +799,8 @@ pub fn apply_studio_theme(ctx: &egui::Context) {
     style.text_styles.insert(TextStyle::Monospace, egui::FontId::monospace(14.0));
     style.text_styles.insert(TextStyle::Heading, egui::FontId::proportional(26.0));
     
-    // Un peu plus d'espace entre les éléments
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
     
-    // Appliquer le style
     ctx.set_style(style);
 }

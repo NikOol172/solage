@@ -88,12 +88,8 @@ pub struct WidgetDef {
     #[serde(rename = "type")]
     pub widget_type: WidgetType,
 
-    // Configuration YAML (Polyvalent : String, Number, Bool)
-    // On utilise serde_json::Value pour accepter n'importe quoi du YAML
     pub default: Option<serde_json::Value>, 
     
-    // État Interne (Ce que l'UI modifie)
-    // Ce champ n'est pas dans le YAML, on l'ignorera au chargement (skip)
     #[serde(skip)] 
     pub value: Option<String>,
 
@@ -102,27 +98,21 @@ pub struct WidgetDef {
     pub max: Option<f32>,
     pub validation: Option<String>,
     pub compute: Option<String>,
-    pub options: Option<Vec<String>>, // Pour les dropdowns
-    pub directory: Option<bool>,      // Pour les path
+    pub options: Option<Vec<String>>,
+    pub directory: Option<bool>,
 }
 
 impl WidgetDef {
     pub fn validation_rule(&self) -> Option<&str> {
-        // CORRECTION 1 : On utilise 'self' au lieu de 'widget'
         match self.widget_type {
             WidgetType::Text => {
-                // On accède au champ validation de la structure
                 self.validation.as_deref()
             }
-            // Pour les sliders ou autres, pas de validation (ou à adapter)
             _ => None, 
         }
     }
 
     pub fn compute_rule(&self) -> Option<&str> {
-        // CORRECTION 2 : Plus besoin de "match" sur les types !
-        // Comme WidgetDef est une structure, le champ 'compute' est
-        // disponible pour tout le monde directement.
         self.compute.as_deref()
     }
 }
@@ -144,5 +134,5 @@ pub struct NavState {
     pub section: usize,
     pub mode: usize,
     pub flavor: usize,
-    pub step: usize,    // ← NOUVEAU
+    pub step: usize,
 }

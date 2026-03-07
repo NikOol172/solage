@@ -9,39 +9,12 @@ use android_activity::AndroidApp;
 #[cfg(target_os = "android")]
 use eframe::egui;
 
-// --- CONFIGURATION DE DÉMO MOBILE ---
-// On la définit ici pour que le mobile ait sa propre "personnalité"
-const MOBILE_DEMO_YAML: &str = r#"
-title: "Solage Mobile"
-version: "1.0"
-sections:
-  - name: "Contrôle"
-    icon: "📱"
-    modes:
-      - name: "Tactile"
-        flavors:
-          - name: "Simple"
-            rows:
-              - key: "status"
-                label: "État"
-                widget: { type: "text", default: "Prêt" }
-              - key: "brightness"
-                label: "Luminosité"
-                widget: { type: "slider", min: 0.0, max: 100.0, default: 80.0 }
-              - key: "vibrate"
-                label: "Vibration"
-                widget: { type: "bool", default: true }
-"#;
-
-// --- 1. IMPLÉMENTATION DU BACKEND MOBILE ---
 struct MobileBackend {
     data_dir: PathBuf,
 }
 
 impl PlatformBackend for MobileBackend {
     fn pick_file(&self) -> Option<PathBuf> {
-        // Sur mobile, pour l'instant, on ne supporte pas le File Picker système
-        // On pourrait utiliser JNI plus tard, mais pour l'instant on retourne None.
         log::info!("Pick file demandé, mais non supporté sur cette version mobile.");
         None
     }
@@ -61,18 +34,15 @@ impl PlatformBackend for MobileBackend {
     }
 }
 
-// --- 2. POINT D'ENTRÉE ANDROID ---
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
     use log::LevelFilter;
 
-    // Initialisation des logs (visible via 'adb logcat')
     android_logger::init_once(
         android_logger::Config::default().with_max_level(LevelFilter::Info)
     );
 
-    // Récupération du dossier interne de l'app (/data/data/com.nhoule.solage/...)
     let data_dir = app.internal_data_path()
         .unwrap_or_else(|| PathBuf::from("/data/local/tmp"));
 
@@ -90,16 +60,8 @@ fn android_main(app: AndroidApp) {
         "Solage Mobile",
         options,
         Box::new(move |cc| {
-            // A. On crée notre backend spécifique
-            let backend = MobileBackend { data_dir };
-            
-            // B. On initialise l'UI commune avec ce backend
-            let mut solage_app = SolageApp::new(cc, Box::new(backend), Box::new(NoAuth::new()));
-            
-            // C. CRUCIAL : On injecte la config de démo immédiatement !
-            // Comme on n'a pas de bouton "Ouvrir", il faut que l'app se lance avec du contenu.
-            // solage_app.load_yaml_string(MOBILE_DEMO_YAML);
-            
+            let backend = MobileBackend { data_dir };      
+            let mut solage_app = SolageApp::new(cc, Box::new(backend), Box::new(NoAuth::new()));;           
             Ok(Box::new(solage_app))
         }),
     ).unwrap();

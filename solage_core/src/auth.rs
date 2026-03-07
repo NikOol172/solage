@@ -12,7 +12,7 @@ pub trait AuthProvider {
     fn state(&self) -> &AuthState;
     fn login(&mut self, username: &str, password: &str, ctx: &egui::Context);
     fn logout(&mut self);
-    fn poll(&mut self) {}  // Implémentation vide par défaut
+    fn poll(&mut self) {}
     fn base_url(&self) -> Option<&str> { None }
     
     fn is_ready(&self) -> bool {
