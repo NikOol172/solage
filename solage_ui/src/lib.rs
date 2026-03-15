@@ -1,5 +1,6 @@
 use egui::{Ui, Color32, RichText, Visuals, TextStyle};
 use egui_extras::{TableBuilder, Column};
+use egui_file_dialog::FileDialog;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -8,6 +9,69 @@ use std::sync::mpsc::Receiver;
 
 use solage_data::{AppConfig, NavState, WidgetDef, Flavor, AppState, GlobalPreferences, WidgetType as SolageWidget}; 
 use solage_core::{ScriptEngine, PlatformBackend, ScriptContext, AuthProvider, AuthState, load_config, load_state, save_state, save_preferences, load_preferences};
+use std::sync::Mutex;
+
+// La file d'attente pour récupérer les textes
+pub static PENDING_TEXT_UPDATES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+// Le callback appelé par Android quand on clique sur "OK"
+#[cfg(target_os = "android")]
+#[no_mangle]
+// ON REVIENT À "C" POUR QUE LA JVM TROUVE LA FONCTION !
+pub extern "C" fn Java_com_cloudcompositing_solage_MainActivity_onTexteSaisi(
+    mut env: jni::JNIEnv,
+    _this: jni::objects::JObject, // On garde bien JObject (l'instance) et non JClass !
+    j_row_key: jni::objects::JString,
+    j_texte: jni::objects::JString,
+) {
+    let row_key: String = match env.get_string(&j_row_key) {
+        Ok(java_str) => java_str.into(),
+        Err(_) => String::new(),
+    };
+
+    let texte: String = match env.get_string(&j_texte) {
+        Ok(java_str) => java_str.into(),
+        Err(_) => String::new(),
+    };
+
+    if let Ok(mut queue) = PENDING_TEXT_UPDATES.lock() {
+        queue.push((row_key, texte));
+    }
+}
+
+// L'appel pour ouvrir la pop-up depuis Rust
+#[cfg(target_os = "android")]
+pub fn demander_texte_android(texte_actuel: &str, row_key: &str) {
+    let ctx = ndk_context::android_context();
+    let vm_ptr = ctx.vm();
+    let context_ptr = ctx.context();
+
+    if vm_ptr.is_null() || context_ptr.is_null() { return; }
+
+    unsafe {
+        if let Ok(jvm) = jni::JavaVM::from_raw(vm_ptr.cast()) {
+            
+            // LA CORRECTION CRITIQUE : On récupère l'environnement sans déclencher 
+            // le détachement automatique à la fin de la fonction !
+            let mut env = match jvm.get_env() {
+                Ok(e) => e,
+                Err(_) => jvm.attach_current_thread_permanently().unwrap(),
+            };
+
+            let activity = jni::objects::JObject::from_raw(context_ptr.cast());
+            
+            // On s'assure que la création des chaînes ne panique pas
+            if let (Ok(j_texte), Ok(j_key)) = (env.new_string(texte_actuel), env.new_string(row_key)) {
+                let _ = env.call_method(
+                    &activity,
+                    "demanderTexte",
+                    "(Ljava/lang/String;Ljava/lang/String;)V",
+                    &[(&j_texte).into(), (&j_key).into()]
+                );
+            }
+        }
+    }
+}
 
 struct LoginForm {
     username: String,
@@ -18,6 +82,12 @@ impl Default for LoginForm {
     fn default() -> Self {
         Self { username: String::new(), password: String::new() }
     }
+}
+
+#[derive(Clone, PartialEq)]
+pub enum FileDialogTarget {
+    MainConfig,
+    WidgetPath(String), // Contient la clé (key) du widget pour le mettre à jour
 }
 
 pub struct SolageApp {
@@ -36,6 +106,9 @@ pub struct SolageApp {
     pub file_load_rx: Option<Receiver<PathBuf>>,
     pub toast: Option<(String, f64)>,
     pub theme_applied: bool,
+    pub file_dialog: FileDialog,
+    pub pending_file_target: Option<FileDialogTarget>,
+    pub external_file_rx: Option<std::sync::mpsc::Receiver<(String, String)>>,
 }
 
 impl SolageApp {
@@ -68,6 +141,9 @@ impl SolageApp {
             file_load_rx: None,
             toast: None,
             theme_applied: false,
+            file_dialog: FileDialog::new(),
+            pending_file_target: None,
+            external_file_rx: None,
         };
 
         app
@@ -151,6 +227,7 @@ impl SolageApp {
 
     fn draw_login_screen(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
+
             ui.vertical_centered(|ui| {
                 ui.heading("Connexion");
                 ui.add_space(20.0);
@@ -183,14 +260,52 @@ impl SolageApp {
                 }
             });
         });
-    }
 
+    }
+    
 }
 
 impl eframe::App for SolageApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
+
+        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+        {
+            self.file_dialog.update(ctx);
+            
+            if let Some(path) = self.file_dialog.take_picked() {
+                if let Some(target) = self.pending_file_target.clone() {
+                    match target {
+                        FileDialogTarget::MainConfig => {
+                            self.load_config_from_path(&path);
+                        }
+                        FileDialogTarget::WidgetPath(key) => {
+                            // On met à jour la valeur dans l'état (AppState)
+                            let path_str = path.display().to_string();
+                            // Une petite fonction pour chercher la clé dans la configuration actuelle
+                            update_widget_value(&mut self.state, &key, path_str);
+                        }
+                    }
+                }
+                self.pending_file_target = None;
+            }
+        }
+        
+        #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+        if let Some(rx) = &self.external_file_rx {
+            if let Ok((file_name, content)) = rx.try_recv() {
+                self.load_yaml_string(&content);
+                self.current_config_path = Some(PathBuf::from(&file_name));
+                if let Ok(saved_state) = load_state(&file_name) {
+                    self.state = saved_state;
+                }
+                self.external_file_rx = None;
+            }
+        }
         
         let is_mobile = ctx.content_rect().width() < 600.0;
+
+        log::info!("Frame update, is_mobile={}", is_mobile);
 
         if !self.theme_applied {
             apply_studio_theme(ctx);
@@ -254,7 +369,12 @@ impl eframe::App for SolageApp {
 
         if self.state.config.sections.is_empty() {
             egui::CentralPanel::default().show(ctx, |ui| {
-                
+                ui.label(
+                    egui::RichText::new("🛠️ BUILD: Test API Insets 6")
+                        .color(egui::Color32::RED)
+                        .size(24.0)
+                        .strong()
+                );
                 if let Some(err) = &self.error_msg {
                     ui.group(|ui| {
                         ui.colored_label(Color32::RED, "🛑 Erreur");
@@ -275,17 +395,61 @@ impl eframe::App for SolageApp {
                         let btn = egui::Button::new(RichText::new("📂 Ouvrir fichier local...").size(16.0))
                             .min_size(egui::vec2(300.0, 35.0));
                         if ui.add(btn).clicked() {
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            self.file_load_rx = Some(rx);
-                            self.backend.pick_file_async(tx);
+                            // Sur ordinateur, on lance egui-file-dialog
+                            #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+                            {
+                                self.pending_file_target = Some(FileDialogTarget::MainConfig);
+                                self.file_dialog.pick_file(); 
+                            }
+                            
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                self.external_file_rx = Some(rx);
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if let Some(file) = rfd::AsyncFileDialog::new().pick_file().await {
+                                        let bytes = file.read().await;
+                                        if let Ok(text) = String::from_utf8(bytes) {
+                                            let _ = tx.send((file.file_name(), text));
+                                        }
+                                    }
+                                });
+                            }
+
+                            #[cfg(target_os = "android")]
+                            {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                self.external_file_rx = Some(rx);
+                                self.backend.pick_file_async_mobile(tx);
+                            }
                         }
                         ui.add_space(15.0);
                     }
 
                     ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                         ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(&mut self.url_input)
+                            // 1. On vide la file d'attente (mise à jour asynchrone)
+                            #[cfg(target_os = "android")]
+                            if let Ok(mut queue) = PENDING_TEXT_UPDATES.lock() {
+                                for (cle, nouveau_texte) in queue.drain(..) {
+                                    if cle == "url_input" {
+                                        self.url_input = nouveau_texte;
+                                    }
+                                }
+                            }
+
+                            // 2. Le TextEdit
+                            let response = ui.add(egui::TextEdit::singleline(&mut self.url_input)
                                 .desired_width(220.0));
+
+                            // 3. L'appel de la pop-up au clic
+                            #[cfg(target_os = "android")]
+                            if response.clicked() {
+                                // Pas d'erreur de borrow checker ici car on utilise "self.url_input" sans &mut
+                                demander_texte_android(&self.url_input, "url_input");
+                            }
+
+                            // 4. Le bouton
                             if ui.add(egui::Button::new("⬇ URL")
                                 .min_size(egui::vec2(70.0, 30.0))).clicked() {
                                 let url = self.url_input.clone();
@@ -449,8 +613,25 @@ impl eframe::App for SolageApp {
                 }
                 ui.add_space(20.0);
                 if ui.button("📂 Ouvrir autre...").clicked() {
-                    if let Some(path) = self.backend.pick_file() {
-                        self.load_config_from_path(&path);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        self.pending_file_target = Some(FileDialogTarget::MainConfig);
+                        self.file_dialog.pick_file(); 
+                    }
+                    
+                    // Sur le Web, on lance la boite d'upload du navigateur !
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        self.external_file_rx = Some(rx);
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Some(file) = rfd::AsyncFileDialog::new().pick_file().await {
+                                let bytes = file.read().await;
+                                if let Ok(text) = String::from_utf8(bytes) {
+                                    let _ = tx.send((file.file_name(), text));
+                                }
+                            }
+                        });
                     }
                 }
             });
@@ -492,9 +673,9 @@ impl eframe::App for SolageApp {
                     let f_idx = self.state.nav.flavor;
                     if let Some(active_flavor) = active_mode.flavors.get_mut(f_idx) {
                         if is_mobile {
-                            draw_single_step(ui, active_flavor, &mut script_context, &self.engine, &self.backend, &mut self.state.nav);
+                            draw_single_step(ui, active_flavor, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &mut self.state.nav);
                         } else {
-                            draw_comparison_table(ui, active_flavor, &mut script_context, &self.engine, &self.backend);
+                            draw_comparison_table(ui, active_flavor, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target);
                         }
                     }
                 }
@@ -579,7 +760,8 @@ fn draw_single_step(
     flavor: &mut Flavor,
     _script_context: &mut ScriptContext,
     engine: &ScriptEngine,
-    backend: &Box<dyn PlatformBackend>,
+    file_dialog: &mut egui_file_dialog::FileDialog, // Remplace backend
+    pending_target: &mut Option<FileDialogTarget>,
     nav: &mut NavState,
 ) {
     if flavor.steps.is_empty() {
@@ -621,7 +803,7 @@ fn draw_single_step(
                         })
                         .unwrap_or_default()
                 });
-            draw_cell_value(ui, value, &row_def.widget, engine, backend);
+            draw_cell_value(ui, value, &row_def.widget, &row_def.key, engine, file_dialog, pending_target);
         });
     }
 }
@@ -631,7 +813,8 @@ fn draw_comparison_table(
     flavor: &mut Flavor, 
     _script_context: &mut ScriptContext, 
     engine: &ScriptEngine, 
-    backend: &Box<dyn PlatformBackend>
+    file_dialog: &mut egui_file_dialog::FileDialog,
+    pending_target: &mut Option<FileDialogTarget>,
 ) {
     if flavor.steps.is_empty() {
         ui.colored_label(Color32::GRAY, "Aucun step défini");
@@ -681,7 +864,7 @@ fn draw_comparison_table(
                                         .unwrap_or_default()
                                 });
 
-                            draw_cell_value(ui, value, &row_def.widget, engine, backend);
+                            draw_cell_value(ui, value, &row_def.widget, &row_def.key, engine, file_dialog, pending_target);
                         });
                     }
                 });
@@ -690,21 +873,41 @@ fn draw_comparison_table(
 }
 
 fn draw_cell_value(
-    ui: &mut Ui,
+    ui: &mut egui::Ui,
     value: &mut String,
     widget: &WidgetDef,
+    row_key: &str,
     _engine: &ScriptEngine,
-    backend: &Box<dyn PlatformBackend>,
+    file_dialog: &mut egui_file_dialog::FileDialog,
+    pending_target: &mut Option<FileDialogTarget>,
 ) {
+    log::info!("draw_cell_value appelé, widget={:?}", widget.widget_type);
+    
+    let mut handle_text_edit = |ui: &mut egui::Ui, val: &mut String| {
+        let response = ui.text_edit_singleline(val);
+        log::info!("text_edit response: focused={} clicked={}", response.has_focus(), response.clicked());
+        
+        #[cfg(target_os = "android")]
+        if response.clicked() || response.gained_focus() {
+            // On utilise la méthode C directe et allégée
+            forcer_clavier_android(true);
+        }
+
+        response
+    };
+
+    // 2. On utilise notre nouvelle fonction dans le match
     match widget.widget_type {
-        SolageWidget::Text => { ui.text_edit_singleline(value); },
+        SolageWidget::Text => { 
+            handle_text_edit(ui, value); 
+        },
         SolageWidget::Number => {
             if let Ok(mut num) = value.parse::<f32>() {
                 if ui.add(egui::DragValue::new(&mut num)).changed() {
                     *value = num.to_string();
                 }
             } else {
-                ui.text_edit_singleline(value);
+                handle_text_edit(ui, value); // <-- Remplacé ici aussi
             }
         },
         SolageWidget::Slider => {
@@ -724,11 +927,14 @@ fn draw_cell_value(
         },
         SolageWidget::Path => {
             ui.horizontal(|ui| {
-                ui.text_edit_singleline(value);
-                if ui.button("📂").clicked() {
-                    if let Some(p) = backend.pick_file() {
-                        *value = p.display().to_string();
-                    }
+                handle_text_edit(ui, value); // <-- Et remplacé ici !
+                
+                #[cfg(not(target_arch = "wasm32"))]
+                // ASTUCE : On remplace l'emoji par du texte standard pour s'assurer 
+                // que la police d'egui l'affiche correctement sur Android.
+                if ui.button("Ouvrir...").clicked() { 
+                    *pending_target = Some(FileDialogTarget::WidgetPath(row_key.to_string()));
+                    file_dialog.pick_file(); 
                 }
             });
         },
@@ -745,6 +951,29 @@ fn draw_cell_value(
             }
         },
         _ => { ui.label(value.as_str()); }
+    }
+}
+
+fn update_widget_value(state: &mut AppState, target_key: &str, new_value: String) {
+    for section in &mut state.config.sections {
+        for mode in &mut section.modes {
+            for flavor in &mut mode.flavors {
+                for step in &mut flavor.steps {
+                    // Si on trouve la clé dans les valeurs de l'étape courante, on la met à jour
+                    if step.values.contains_key(target_key) {
+                        step.values.insert(target_key.to_string(), new_value.clone());
+                        return;
+                    }
+                    // Ou on la crée si elle n'y était pas encore
+                    for row in &flavor.row_definitions {
+                        if row.key == target_key {
+                            step.values.insert(target_key.to_string(), new_value.clone());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -804,3 +1033,28 @@ pub fn apply_studio_theme(ctx: &egui::Context) {
     
     ctx.set_style(style);
 }
+
+#[cfg(target_os = "android")]
+extern "C" {
+    pub fn ANativeActivity_showSoftInput(activity: *mut std::ffi::c_void, flags: u32);
+    pub fn ANativeActivity_hideSoftInput(activity: *mut std::ffi::c_void, flags: u32);
+}
+
+#[cfg(target_os = "android")]
+pub fn forcer_clavier_android(afficher: bool) {
+    let ctx = ndk_context::android_context();
+    let activity_ptr = ctx.context();
+
+    if activity_ptr.is_null() { return; }
+
+    unsafe {
+        if afficher {
+            ANativeActivity_showSoftInput(activity_ptr, 2); // 2 = SHOW_FORCED
+        } else {
+            ANativeActivity_hideSoftInput(activity_ptr, 0); // 0 = HIDE_IMPLICIT_ONLY
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn forcer_clavier_android(_afficher: bool) {}

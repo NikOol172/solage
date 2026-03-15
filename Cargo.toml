@@ -24,8 +24,11 @@ serde_yml   = "0.0.12"          # ← Remplace serde_yaml déprécié
 # UI
 egui        = "0.33"
 egui_extras = { version = "0.33"}
-eframe      = { version = "0.33", features = ["default"] }
+egui-file-dialog = "0.12"
+eframe      = { version = "0.33" }
 ehttp       = "0.6"
+jni         = "0.21"   
+ndk-context = "0.1"
 
 # Scripting
 rhai        = "1.24"

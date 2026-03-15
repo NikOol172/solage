@@ -10,19 +10,13 @@ pub use auth::{AuthProvider, AuthState, NoAuth};
 pub use solage_data::*;
 
 pub trait PlatformBackend {
-    fn pick_file(&self) -> Option<PathBuf>;
-
-    fn pick_file_async(&self, tx: std::sync::mpsc::Sender<PathBuf>) {
-        // Par défaut (ex: pour le Web), on tente la méthode synchrone
-        if let Some(path) = self.pick_file() {
-            let _ = tx.send(path);
-        }
-    }
-    
     fn save_file(&self, path: &PathBuf, content: &str) -> Result<(), String>;
     fn launch_external(&self, command: &str, args: &[&str]) -> Result<(), String>;
     fn get_config_dir(&self) -> PathBuf;
     fn default_url(&self) -> Option<String> { None }
+    fn pick_file_async_mobile(&self, _tx: std::sync::mpsc::Sender<(String, String)>) {
+        // Implémentation par défaut vide pour ne pas casser Desktop/Web
+    }
 }
 
 

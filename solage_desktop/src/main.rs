@@ -8,18 +8,6 @@ use std::path::PathBuf;
 struct DesktopBackend;
 
 impl PlatformBackend for DesktopBackend {
-    fn pick_file(&self) -> Option<PathBuf> {
-        rfd::FileDialog::new().pick_file()
-    }
-
-    fn pick_file_async(&self, tx: std::sync::mpsc::Sender<PathBuf>) {
-        std::thread::spawn(move || {
-            if let Some(path) = rfd::FileDialog::new().pick_file() {
-                let _ = tx.send(path);
-            }
-        });
-    }
-
     fn save_file(&self, path: &PathBuf, content: &str) -> Result<(), String> {
         std::fs::write(path, content).map_err(|e| e.to_string())
     }

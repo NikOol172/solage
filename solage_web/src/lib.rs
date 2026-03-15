@@ -13,7 +13,6 @@ struct WebBackend;
 
 #[cfg(target_arch = "wasm32")]
 impl PlatformBackend for WebBackend {
-    fn pick_file(&self) -> Option<PathBuf> { None }
     fn save_file(&self, _path: &PathBuf, _content: &str) -> Result<(), String> {
         Err("Non supporté".to_string())
     }
