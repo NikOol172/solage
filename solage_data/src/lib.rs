@@ -100,6 +100,9 @@ pub struct WidgetDef {
     pub compute: Option<String>,
     pub options: Option<Vec<String>>,
     pub directory: Option<bool>,
+    pub speed: Option<f32>,
+    pub speed_shift: Option<f32>,
+    pub precision: Option<usize>,
 }
 
 impl WidgetDef {

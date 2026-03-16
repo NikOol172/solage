@@ -7,6 +7,7 @@ edition             = "2021"
 solage_data         = { workspace = true }
 solage_core         = { workspace = true }
 serde_json          = { workspace = true }
+rhai                = { workspace = true }
 egui                = { workspace = true }
 egui_extras         = { workspace = true }
 egui-file-dialog    = { workspace = true }
@@ -15,6 +16,7 @@ ehttp               = { workspace = true }
 log                 = { workspace = true }
 jni                 = { workspace = true }
 ndk-context         = { workspace = true }
+regex               = "1.10"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 rfd                 = "0.17.2"

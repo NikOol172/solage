@@ -6,6 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
+use rhai::{Engine, Scope, Map, Dynamic};
 
 use solage_data::{AppConfig, NavState, WidgetDef, Flavor, AppState, GlobalPreferences, WidgetType as SolageWidget}; 
 use solage_core::{ScriptEngine, PlatformBackend, ScriptContext, AuthProvider, AuthState, load_config, load_state, save_state, save_preferences, load_preferences};
@@ -67,6 +68,55 @@ pub fn demander_texte_android(texte_actuel: &str, row_key: &str) {
                     "demanderTexte",
                     "(Ljava/lang/String;Ljava/lang/String;)V",
                     &[(&j_texte).into(), (&j_key).into()]
+                );
+            }
+        }
+    }
+}
+
+// 1. La nouvelle file d'attente
+pub static PENDING_FILE_UPDATES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+// 2. La réception (Appelée par Kotlin)
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_com_cloudcompositing_solage_MainActivity_onFichierChoisi(
+    mut env: jni::JNIEnv,
+    _this: jni::objects::JObject,
+    j_row_key: jni::objects::JString,
+    j_uri: jni::objects::JString,
+) {
+    let row_key: String = env.get_string(&j_row_key).map(|s| s.into()).unwrap_or_default();
+    let uri: String = env.get_string(&j_uri).map(|s| s.into()).unwrap_or_default();
+
+    if let Ok(mut queue) = crate::PENDING_FILE_UPDATES.lock() {
+        queue.push((row_key, uri));
+    }
+}
+
+// 3. L'envoi (Appelée par egui)
+#[cfg(target_os = "android")]
+pub fn choisir_fichier_android(row_key: &str) {
+    let ctx = ndk_context::android_context();
+    let vm_ptr = ctx.vm();
+    let context_ptr = ctx.context();
+
+    if vm_ptr.is_null() || context_ptr.is_null() { return; }
+
+    unsafe {
+        if let Ok(jvm) = jni::JavaVM::from_raw(vm_ptr.cast()) {
+            let mut env = match jvm.get_env() {
+                Ok(e) => e,
+                Err(_) => jvm.attach_current_thread_permanently().unwrap(),
+            };
+
+            let activity = jni::objects::JObject::from_raw(context_ptr.cast());
+            if let Ok(j_key) = env.new_string(row_key) {
+                let _ = env.call_method(
+                    &activity,
+                    "choisirFichier",
+                    "(Ljava/lang/String;)V",
+                    &[(&j_key).into()]
                 );
             }
         }
@@ -262,7 +312,71 @@ impl SolageApp {
         });
 
     }
-    
+
+    pub fn mettre_a_jour_valeur_yaml(&mut self, row_key: &str, nouvelle_valeur: String) {
+        
+        // On récupère les indices actuels depuis la navigation
+        let section_idx = self.state.nav.section;
+        let mode_idx = self.state.nav.mode;
+        let flavor_idx = self.state.nav.flavor;
+        let step_idx = self.state.nav.step;
+
+        // Navigation sécurisée dans l'arbre (Si self.state.config est votre racine)
+        if let Some(section) = self.state.config.sections.get_mut(section_idx) {
+            if let Some(mode) = section.modes.get_mut(mode_idx) {
+                if let Some(flavor) = mode.flavors.get_mut(flavor_idx) {
+                    
+                    // --- OPTION A : Injection dans le Step (HashMap) ---
+                    if let Some(step) = flavor.steps.get_mut(step_idx) {
+                        step.values.insert(row_key.to_string(), nouvelle_valeur.clone());
+                        println!("SOLAGE : Dictionnaire du Step '{}' mis à jour -> {} = {}", 
+                            step.name, row_key, nouvelle_valeur);
+                    }
+
+                    // --- OPTION B : Injection dans le WidgetDef (État de l'UI) ---
+                    // for row_def in &mut flavor.row_definitions {
+                    //     if row_def.key == row_key {
+                    //         row_def.widget.value = Some(nouvelle_valeur.clone());
+                    //         println!("SOLAGE : Widget '{}' mis à jour avec la valeur '{}'", 
+                    //             row_def.key, nouvelle_valeur);
+                    //         break; // On arrête de chercher une fois trouvé
+                    //     }
+                    // }
+                }
+            }
+        }
+    }
+
+    /// Évalue un script Rhai en lui donnant accès à toutes les valeurs du Step actuel
+    pub fn evaluer_compute(
+        // &self, 
+        compute_script: &str, 
+        valeurs_actuelles: &std::collections::HashMap<String, String>
+    ) -> Result<String, Box<rhai::EvalAltResult>> {
+        
+        // 1. Instanciation du moteur (Idéalement, gardez cet Engine en cache dans SolageApp 
+        // pour ne pas le recréer à chaque fois, mais on le fait ici pour l'exemple)
+        let engine = Engine::new();
+        let mut scope = Scope::new();
+
+        // 2. Conversion du HashMap Rust en Map Rhai
+        let mut rhai_map = Map::new();
+        for (cle, valeur) in valeurs_actuelles.iter() {
+            // Puisque vos données sont des String, on les passe telles quelles.
+            // (Dans le script Rhai, il faudra utiliser parse_float() pour faire des maths)
+            rhai_map.insert(cle.clone().into(), Dynamic::from(valeur.clone()));
+        }
+        
+        // On injecte le dictionnaire sous le nom "values" dans le script
+        scope.push("values", rhai_map);
+
+        // 3. Évaluation du script
+        // On s'attend à ce que le script retourne une valeur (Dynamic)
+        let resultat: Dynamic = engine.eval_with_scope(&mut scope, compute_script)?;
+
+        // 4. On convertit le résultat dynamique de Rhai en String pour votre HashMap
+        Ok(resultat.to_string())
+    }
 }
 
 impl eframe::App for SolageApp {
@@ -306,6 +420,20 @@ impl eframe::App for SolageApp {
         let is_mobile = ctx.content_rect().width() < 600.0;
 
         log::info!("Frame update, is_mobile={}", is_mobile);
+
+        // 1. Le "Bumper" du haut (Encoche / Caméra)    
+        #[cfg(target_os = "android")]
+        egui::TopBottomPanel::top("android_safe_area_top")
+            .frame(egui::Frame::none()) // Totalement invisible
+            .exact_height(45.0)         // On repasse en f32 ! Ajustez selon l'encoche
+            .show(ctx, |_ui| {});
+
+        // 2. Le "Bumper" du bas (Barre de navigation / Coins)
+        #[cfg(target_os = "android")]
+        egui::TopBottomPanel::bottom("android_safe_area_bottom")
+            .frame(egui::Frame::none()) // Totalement invisible
+            .exact_height(35.0)         // Espace pour le balayage
+            .show(ctx, |_ui| {});
 
         if !self.theme_applied {
             apply_studio_theme(ctx);
@@ -370,7 +498,7 @@ impl eframe::App for SolageApp {
         if self.state.config.sections.is_empty() {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.label(
-                    egui::RichText::new("🛠️ BUILD: Test API Insets 6")
+                    egui::RichText::new("🛠️ BUILD: Test API Insets 8")
                         .color(egui::Color32::RED)
                         .size(24.0)
                         .strong()
@@ -391,40 +519,44 @@ impl eframe::App for SolageApp {
                 ui.add_space(40.0);
 
                 ui.vertical_centered(|ui| {
-                    if !is_mobile {
-                        let btn = egui::Button::new(RichText::new("📂 Ouvrir fichier local...").size(16.0))
-                            .min_size(egui::vec2(300.0, 35.0));
-                        if ui.add(btn).clicked() {
-                            // Sur ordinateur, on lance egui-file-dialog
-                            #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-                            {
-                                self.pending_file_target = Some(FileDialogTarget::MainConfig);
-                                self.file_dialog.pick_file(); 
-                            }
-                            
-                            #[cfg(target_arch = "wasm32")]
-                            {
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                self.external_file_rx = Some(rx);
-                                wasm_bindgen_futures::spawn_local(async move {
-                                    if let Some(file) = rfd::AsyncFileDialog::new().pick_file().await {
-                                        let bytes = file.read().await;
-                                        if let Ok(text) = String::from_utf8(bytes) {
-                                            let _ = tx.send((file.file_name(), text));
-                                        }
-                                    }
-                                });
-                            }
+                    // On retire le `if !is_mobile` pour que le bouton s'affiche sur Android !
+                    let btn = egui::Button::new(egui::RichText::new("📂 Ouvrir fichier local...").size(16.0))
+                        .min_size(egui::vec2(300.0, 35.0));
 
-                            #[cfg(target_os = "android")]
-                            {
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                self.external_file_rx = Some(rx);
-                                self.backend.pick_file_async_mobile(tx);
-                            }
+                    if ui.add(btn).clicked() {
+                        
+                        // --- BIFURCATION DESKTOP (Windows/Linux/Mac) ---
+                        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+                        {
+                            self.pending_file_target = Some(FileDialogTarget::MainConfig);
+                            self.file_dialog.pick_file(); 
                         }
-                        ui.add_space(15.0);
+                        
+                        // --- BIFURCATION WEB (WASM) ---
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.external_file_rx = Some(rx);
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if let Some(file) = rfd::AsyncFileDialog::new().pick_file().await {
+                                    let bytes = file.read().await;
+                                    if let Ok(text) = String::from_utf8(bytes) {
+                                        let _ = tx.send((file.file_name(), text));
+                                    }
+                                }
+                            });
+                        }
+
+                        // --- BIFURCATION MOBILE (Android) ---
+                        #[cfg(target_os = "android")]
+                        {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.external_file_rx = Some(rx);
+                            // On lance votre méthode asynchrone pour le sélecteur natif
+                            self.backend.pick_file_async_mobile(tx);
+                        }
                     }
+                    ui.add_space(15.0);
 
                     ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                         ui.horizontal(|ui| {
@@ -435,6 +567,15 @@ impl eframe::App for SolageApp {
                                     if cle == "url_input" {
                                         self.url_input = nouveau_texte;
                                     }
+                                }
+                            }
+
+                            // Dans votre impl eframe::App pour SolageApp, méthode update() :
+                            #[cfg(target_os = "android")]
+                            if let Ok(mut queue) = PENDING_FILE_UPDATES.lock() {
+                                for (row_key, uri) in queue.drain(..) {
+                                    // On réutilise votre fonction magique !
+                                    self.mettre_a_jour_valeur_yaml(&row_key, uri);
                                 }
                             }
 
@@ -637,6 +778,22 @@ impl eframe::App for SolageApp {
             });
         }
 
+        #[cfg(target_os = "android")]
+        if let Ok(mut queue) = PENDING_TEXT_UPDATES.lock() {
+            // S'il y a des données, on les dépile
+            for (row_key, nouveau_texte) in queue.drain(..) {
+                
+                // Routage selon la clé
+                if row_key == "url_input" {
+                    self.url_input = nouveau_texte;
+                } else {
+                    // C'est ici que la magie opère pour vos cellules !
+                    // On envoie la clé et la valeur à votre gestionnaire YAML
+                    self.mettre_a_jour_valeur_yaml(&row_key, nouveau_texte);
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &self.error_msg {
                 ui.colored_label(Color32::RED, format!("⚠ {}", err));
@@ -803,7 +960,22 @@ fn draw_single_step(
                         })
                         .unwrap_or_default()
                 });
-            draw_cell_value(ui, value, &row_def.widget, &row_def.key, engine, file_dialog, pending_target);
+            let a_change = draw_cell_value(ui, value, &row_def.widget, &row_def.key, engine, file_dialog, pending_target);
+
+            // Si l'utilisateur vient de modifier CETTE cellule, on déclenche le Compute
+            if a_change {
+                for autre_row in &flavor.row_definitions {
+                    if let Some(script_rhai) = autre_row.widget.compute_rule() {
+                        
+                        // On appelle notre fonction statique
+                        if let Ok(nouveau_resultat) = SolageApp::evaluer_compute(script_rhai, &step.values) {
+                            // On met à jour la valeur calculée silencieusement !
+                            println!("Calcul Rhai réussi pour {} : {}", autre_row.key, nouveau_resultat);
+                            step.values.insert(autre_row.key.clone(), nouveau_resultat);
+                        }
+                    }
+                }
+            }
         });
     }
 }
@@ -864,7 +1036,22 @@ fn draw_comparison_table(
                                         .unwrap_or_default()
                                 });
 
-                            draw_cell_value(ui, value, &row_def.widget, &row_def.key, engine, file_dialog, pending_target);
+                            let a_change = draw_cell_value(ui, value, &row_def.widget, &row_def.key, engine, file_dialog, pending_target);
+
+                            // Si l'utilisateur vient de modifier CETTE cellule, on déclenche le Compute
+                            if a_change {
+                                for autre_row in &flavor.row_definitions {
+                                    if let Some(script_rhai) = autre_row.widget.compute_rule() {
+                                        
+                                        // On appelle notre fonction statique
+                                        if let Ok(nouveau_resultat) = SolageApp::evaluer_compute(script_rhai, &step.values) {
+                                            // On met à jour la valeur calculée silencieusement !
+                                            println!("Calcul Rhai réussi pour {} : {}", autre_row.key, nouveau_resultat);
+                                            step.values.insert(autre_row.key.clone(), nouveau_resultat);
+                                        }
+                                    }
+                                }
+                            }
                         });
                     }
                 });
@@ -880,78 +1067,234 @@ fn draw_cell_value(
     _engine: &ScriptEngine,
     file_dialog: &mut egui_file_dialog::FileDialog,
     pending_target: &mut Option<FileDialogTarget>,
-) {
+) -> bool {
     log::info!("draw_cell_value appelé, widget={:?}", widget.widget_type);
     
+    let mut valeur_a_change = false;
+
     let mut handle_text_edit = |ui: &mut egui::Ui, val: &mut String| {
         let response = ui.text_edit_singleline(val);
-        log::info!("text_edit response: focused={} clicked={}", response.has_focus(), response.clicked());
         
         #[cfg(target_os = "android")]
-        if response.clicked() || response.gained_focus() {
-            // On utilise la méthode C directe et allégée
-            forcer_clavier_android(true);
+        {
+            // Votre correctif : on force la détection du clic même si le TextEdit l'a consommé
+            if response.interact(egui::Sense::click()).clicked() {
+                // On appelle notre boîte de dialogue native robuste
+                demander_texte_android(val, row_key);
+            }
         }
-
+        
         response
     };
+
+    // ---------------------------------------------------------
+    // MOTEUR DE VALIDATION
+    // ---------------------------------------------------------
+    let mut est_valide = true;
+
+    // On vérifie si ce widget possède une règle de validation
+    if let Some(regle_str) = widget.validation_rule() {
+        // Si la valeur n'est pas vide, on la teste contre la Regex
+        if !value.is_empty() {
+            // Note: Pour des performances optimales à 60 FPS, il faudrait mettre en cache 
+            // les regex compilées. Mais pour l'UI, cette compilation à la volée est acceptable.
+            if let Ok(regex) = regex::Regex::new(regle_str) {
+                est_valide = regex.is_match(value);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // MODIFICATION DU STYLE (Si invalide)
+    // ---------------------------------------------------------
+    // egui utilise ui.scope pour isoler les changements de style à ce widget uniquement
+    ui.scope(|ui| {
+        
+        // Si la validation échoue, on teint l'interface en rouge
+        if !est_valide {
+            let rouge_erreur = egui::Color32::from_rgb(200, 50, 50);
+            
+            // On force le texte et les bordures en rouge
+            ui.visuals_mut().override_text_color = Some(rouge_erreur);
+            ui.visuals_mut().selection.stroke.color = rouge_erreur;
+            ui.visuals_mut().widgets.inactive.bg_stroke.color = rouge_erreur;
+            ui.visuals_mut().widgets.hovered.bg_stroke.color = rouge_erreur;
+        }
+
+        // On enveloppe le widget dans une UI qui gérera l'info-bulle
+        let response = ui.horizontal(|ui| {
+            
+            // L'indicateur visuel (Optionnel : un petit icône d'avertissement)
+            if !est_valide {
+                ui.label("⚠️");
+            }
+
+            // =========================================================
+            // ICI VIENT VOTRE GRAND MATCH SUR LE TYPE DE WIDGET
+            // =========================================================
+            match widget.widget_type {
+                SolageWidget::Text => { /* ... */ },
+                SolageWidget::Number => { /* ... */ },
+                // ... etc ...
+                _ => {}
+            }
+            
+        }).response;
+
+        // Si c'est invalide et que l'utilisateur survole la zone, on explique pourquoi
+        if !est_valide {
+            response.on_hover_text(format!("Erreur de validation.\nDoit respecter la règle : {}", widget.validation_rule().unwrap_or("")));
+        }
+    });
 
     // 2. On utilise notre nouvelle fonction dans le match
     match widget.widget_type {
         SolageWidget::Text => { 
-            handle_text_edit(ui, value); 
+            if handle_text_edit(ui, value).changed() {
+                valeur_a_change = true;
+            }
         },
         SolageWidget::Number => {
-            if let Ok(mut num) = value.parse::<f32>() {
-                if ui.add(egui::DragValue::new(&mut num)).changed() {
+            let mut num = value.parse::<f32>().unwrap_or(0.0);
+            
+            // 1. LE DIAGNOSTIC : On imprime ce que Rust a réellement compris du YAML
+            log::info!("SOLAGE DEBUG - Widget '{}' -> Speed lue : {:?}, Precision lue : {:?}", 
+                row_key, widget.speed, widget.precision);
+
+            // 2. On lit la vitesse de base dictée par le YAML
+            let mut base_speed = widget.speed.unwrap_or(1.0);
+            
+            // 3. LE CORRECTIF MOBILE : L'amortisseur de DPI
+            // #[cfg(target_os = "android")]
+            // {
+            //     // On divise drastiquement la vitesse sur mobile pour compenser 
+            //     // la sensibilité extrême du tactile sur les écrans haute densité.
+            //     base_speed *= 0.05; 
+            // }
+
+            // 4. On gère le Shift (Pour le clavier PC)
+            let vitesse_finale = if ui.input(|i| i.modifiers.shift) {
+                widget.speed_shift.map(|s| s * 10.0).unwrap_or(base_speed)
+            } else {
+                base_speed
+            };
+
+            let mut drag = egui::DragValue::new(&mut num).speed(vitesse_finale);
+            
+            // ... (Le reste de votre code avec precision et min/max reste identique) ...  
+            // --- NOUVEAU : APPLICATION DE LA PRÉCISION VISUELLE ---
+            if let Some(prec) = widget.precision {
+                // Force egui à ne pas afficher plus de décimales que prévu
+                drag = drag.max_decimals(prec)
+                           .min_decimals(prec); // Gardez min_decimals si vous voulez forcer l'affichage des zéros (ex: 1.700)
+            }
+
+            // Application des limites
+            if let Some(min) = widget.min {
+                if let Some(max) = widget.max {
+                    drag = drag.clamp_range(min..=max);
+                } else {
+                    drag = drag.clamp_range(min..=f32::INFINITY);
+                }
+            } else if let Some(max) = widget.max {
+                drag = drag.clamp_range(f32::NEG_INFINITY..=max);
+            }
+
+            let response = ui.add(drag);
+
+            // --- NOUVEAU : FORMATAGE PROPRE POUR LA SAUVEGARDE ---
+            if response.changed() {
+                if let Some(prec) = widget.precision {
+                    // La macro {:.*} prend la précision (prec) puis le nombre (num)
+                    // Si prec = 0, num = 1920.5 -> "*value" deviendra "1920"
+                    // Si prec = 2, num = 1.7 -> "*value" deviendra "1.70"
+                    *value = format!("{:.*}", prec, num);
+                } else {
                     *value = num.to_string();
                 }
-            } else {
-                handle_text_edit(ui, value); // <-- Remplacé ici aussi
+                valeur_a_change = true;
+            }
+
+            #[cfg(target_os = "android")]
+            if response.clicked() {
+                crate::demander_texte_android(value, row_key);
             }
         },
         SolageWidget::Slider => {
-            if let Ok(mut num) = value.parse::<f32>() {
-                let min = widget.min.unwrap_or(0.0);
-                let max = widget.max.unwrap_or(100.0);
-                if ui.add(egui::Slider::new(&mut num, min..=max)).changed() {
-                    *value = num.to_string();
-                }
+            // Un slider a besoin de limites strictes. On définit des valeurs par défaut si absentes.
+            let min = widget.min.unwrap_or(0.0);
+            let max = widget.max.unwrap_or(100.0);
+            
+            let mut num = value.parse::<f32>().unwrap_or(min);
+            
+            // On limite la valeur actuelle pour qu'elle ne sorte pas du slider au chargement
+            num = num.clamp(min, max);
+
+            if ui.add(egui::Slider::new(&mut num, min..=max)).changed() {
+                *value = num.to_string();
+                valeur_a_change = true;
             }
         },
-        SolageWidget::Bool => {
-            let mut b = value.parse::<bool>().unwrap_or(false);
-            if ui.checkbox(&mut b, "").changed() {
-                *value = b.to_string();
+        SolageWidget::Bool | SolageWidget::Checkbox => {
+            // 1. On déclare bien la variable sous le nom "is_checked"
+            let mut is_checked = value.parse::<bool>().unwrap_or(false);
+            
+            // 2. On la passe à egui
+            if ui.checkbox(&mut is_checked, "").changed() {
+                *value = is_checked.to_string();
+                valeur_a_change = true; // On déclenche le Compute Rhai !
             }
         },
         SolageWidget::Path => {
             ui.horizontal(|ui| {
-                handle_text_edit(ui, value); // <-- Et remplacé ici !
+                handle_text_edit(ui, value);
                 
                 #[cfg(not(target_arch = "wasm32"))]
-                // ASTUCE : On remplace l'emoji par du texte standard pour s'assurer 
-                // que la police d'egui l'affiche correctement sur Android.
                 if ui.button("Ouvrir...").clicked() { 
-                    *pending_target = Some(FileDialogTarget::WidgetPath(row_key.to_string()));
-                    file_dialog.pick_file(); 
+                    
+                    // --- BIFURCATION ANDROID ---
+                    #[cfg(target_os = "android")]
+                    {
+                        // Sur mobile, on déclenche l'Intent Kotlin
+                        crate::choisir_fichier_android(row_key);
+                    }
+                    
+                    // --- BIFURCATION DESKTOP ---
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        // Sur PC, on garde votre logique de dialogue interne
+                        *pending_target = Some(FileDialogTarget::WidgetPath(row_key.to_string()));
+                        file_dialog.pick_file(); 
+                    }
                 }
             });
         },
         SolageWidget::Dropdown => {
-            if let Some(options) = &widget.options {
-                let options = options.clone();
-                egui::ComboBox::from_id_salt(&widget as *const _ as usize)
-                    .selected_text(value.as_str())
-                    .show_ui(ui, |ui| {
-                        for opt in &options {
-                            ui.selectable_value(value, opt.clone(), opt);
+            // On récupère les options de votre configuration YAML
+            let options = widget.options.as_ref().map_or(vec![], |o| o.clone());
+            
+            // On s'assure que la valeur actuelle existe, sinon on prend "Sélectionner..."
+            let affichage_actuel = if value.is_empty() {
+                "Sélectionner..."
+            } else {
+                value.as_str()
+            };
+
+            // from_id_source évite les conflits si plusieurs dropdowns ont le même contenu
+            egui::ComboBox::from_id_source(row_key)
+                .selected_text(affichage_actuel)
+                .show_ui(ui, |ui| {
+                    for opt in options {
+                        // selectable_value met à jour 'value' automatiquement si on clique
+                        if ui.selectable_value(value, opt.clone(), &opt).clicked() {
+                            // Action optionnelle au clic (egui a déjà mis à jour la String)
                         }
-                    });
-            }
-        },
-        _ => { ui.label(value.as_str()); }
+                    }
+                });
+        }
     }
+
+    valeur_a_change
 }
 
 fn update_widget_value(state: &mut AppState, target_key: &str, new_value: String) {
@@ -1010,7 +1353,7 @@ pub fn apply_studio_theme(ctx: &egui::Context) {
     visuals.selection.stroke = egui::Stroke::new(1.0, dark_text); 
     
     visuals.widgets.active.bg_fill = solage_blue;
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, dark_text);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
     
     let radius = egui::CornerRadius::same(6);
     visuals.widgets.noninteractive.corner_radius = radius;
