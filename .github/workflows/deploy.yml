@@ -40,9 +40,6 @@ jobs:
         with:
           version: 'latest'
 
-      - name: Install wasm-opt (binaryen)
-        run: sudo apt-get install binaryen
-
       - name: Build project with Trunk
         working-directory: ./solage_web
         run: trunk build --release --public-url /solage/solage_web/
