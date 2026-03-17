@@ -42,7 +42,7 @@ jobs:
 
       - name: Build project with Trunk
         working-directory: ./solage_web
-        run: trunk build --release --public-url /solage/solage_web/--no-wasm-opt
+        run: trunk build --release --public-url /solage/solage_web/ --no-wasm-opt
 
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v4
