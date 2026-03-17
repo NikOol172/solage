@@ -1,17 +1,20 @@
 name: Deploy Web Version to GitHub Pages
 
-# Déclencheur : s'exécute à chaque push sur la branche principale
+# Trigger: runs on every push to the main branch
 on:
   push:
-    branches: [ main ] # Modifiez par "master" si votre branche s'appelle master
+    branches: [ main ] # Change to "master" if your default branch is master
 
-# Autorisations requises pour écrire sur GitHub Pages
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# Required permissions to write to GitHub Pages
 permissions:
   contents: read
   pages: write
   id-token: write
 
-# S'assure qu'un seul déploiement tourne à la fois
+# Ensures only one deployment runs at a time
 concurrency:
   group: "pages"
   cancel-in-progress: true
@@ -24,35 +27,35 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
       
     steps:
-      - name: Récupération du code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Installation de Rust et WebAssembly
+      - name: Install Rust and WebAssembly target
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Installation de Trunk
+      - name: Install Trunk
         uses: jetli/trunk-action@v0.5.0
         with:
           version: 'latest'
 
-      - name: Installation de wasm-opt
+      - name: Install wasm-opt (binaryen)
         run: sudo apt-get install binaryen
 
-      - name: Compilation du projet
-        # ATTENTION : Remplacez "solage-ams" par le nom exact de votre dépôt GitHub !
-        # Le slash à la fin est obligatoire.
+      - name: Build project with Trunk
+        working-directory: ./solage_web
         run: trunk build --release --public-url /solage/solage_web/
 
-      - name: Configuration de GitHub Pages
+      - name: Setup GitHub Pages
         uses: actions/configure-pages@v4
 
-      - name: Préparation des fichiers compilés (dossier dist)
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './dist'
+          # THE FIX IS HERE: Pointing to the correct output folder!
+          path: './solage_web/dist'
 
-      - name: Déploiement sur le Web !
+      - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
