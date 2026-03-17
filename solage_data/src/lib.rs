@@ -125,11 +125,21 @@ pub struct GlobalPreferences {
     pub recent_files: Vec<std::path::PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
-    pub config: AppConfig,
     pub nav: NavState,
+    pub user_values: std::collections::HashMap<String, String>,
     pub prefs: GlobalPreferences,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            nav: NavState::default(),
+            user_values: std::collections::HashMap::new(),
+            prefs: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

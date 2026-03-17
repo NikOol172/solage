@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use rhai::{Engine, Scope, Map, Dynamic};
 
-use solage_data::{AppConfig, NavState, WidgetDef, Flavor, AppState, GlobalPreferences, WidgetType as SolageWidget}; 
+use solage_data::{AppConfig, NavState, WidgetDef, Flavor, Step, AppState, GlobalPreferences, WidgetType as SolageWidget}; 
 use solage_core::{ScriptEngine, PlatformBackend, ScriptContext, AuthProvider, AuthState, load_config, load_state, save_state, save_preferences, load_preferences};
 use std::sync::Mutex;
 
@@ -201,7 +201,11 @@ impl SolageApp {
 
     pub fn load_yaml_string(&mut self, yaml_content: &str) {
         match load_config(yaml_content) {
-            Ok(config) => apply_defaults(&config, &mut self.state),
+            Ok(config) => {
+                apply_defaults(&config, &mut self.state);
+                // LA LIGNE MANQUANTE : On stocke enfin le YAML en mémoire !
+                self.config = Some(config);
+            },
             Err(e) => self.error_msg = Some(format!("Erreur YAML: {}", e)),
         }
     }
@@ -218,27 +222,41 @@ impl SolageApp {
         };
 
         match load_config(&content) {
-            Ok(cfg) => {
-                log::info!("YAML parsé avec succès. Sections trouvées : {}", cfg.sections.len());
+            Ok(mut cfg) => {
+                log::info!("YAML parsé avec succès.");
                 self.error_msg = None; 
 
-                self.config = Some(cfg.clone());
-                self.current_config_path = Some(path.to_path_buf());
-                
-                let state_path = path.with_extension("json");
-                if let Ok(loaded_state) = load_state(&state_path.to_string_lossy()) {
-                     self.state = loaded_state;
-                     if self.state.config.sections.is_empty() {
-                         self.state.config = cfg.clone();
-                     }
-                } else {
-                    apply_defaults(&cfg, &mut self.state);
-                }
-                
-                if self.state.config.sections.is_empty() {
-                    self.error_msg = Some("Le fichier est valide mais ne contient aucune section.".to_string());
-                }
+                // 1. On trouve le chemin du fichier de sauvegarde privé
+                let nom_fichier = path.file_stem().unwrap_or_default().to_string_lossy();
+                let nom_json = format!("{}_data.json", nom_fichier);
+                let save_dir = self.backend.get_config_dir();
+                let safe_save_path = save_dir.join(&nom_json);
 
+                // 2. Si l'utilisateur avait déjà sauvegardé des données pour ce YAML, on les charge
+                if let Ok(loaded_state) = load_state(&safe_save_path.to_string_lossy()) {
+                    self.state = loaded_state;
+                    
+                    // 3. On réinjecte les valeurs sauvegardées dans l'arbre visuel
+                    for section in &mut cfg.sections {
+                        for mode in &mut section.modes {
+                            for flavor in &mut mode.flavors {
+                                for step in &mut flavor.steps {
+                                    for (key, saved_val) in &self.state.user_values {
+                                        // On insère ou on écrase la valeur par défaut du YAML
+                                        step.values.insert(key.clone(), saved_val.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Aucune sauvegarde existante, on remet l'état à zéro
+                    self.state = AppState::default();
+                }
+                
+                // 4. On stocke la configuration finale dans l'application
+                self.config = Some(cfg);
+                self.current_config_path = Some(path.to_path_buf());
                 self.add_to_recents(path.to_path_buf());
             },
             Err(e) => {
@@ -314,37 +332,10 @@ impl SolageApp {
     }
 
     pub fn mettre_a_jour_valeur_yaml(&mut self, row_key: &str, nouvelle_valeur: String) {
+        // Une seule ligne suffit maintenant !
+        self.state.user_values.insert(row_key.to_string(), nouvelle_valeur.clone());
         
-        // On récupère les indices actuels depuis la navigation
-        let section_idx = self.state.nav.section;
-        let mode_idx = self.state.nav.mode;
-        let flavor_idx = self.state.nav.flavor;
-        let step_idx = self.state.nav.step;
-
-        // Navigation sécurisée dans l'arbre (Si self.state.config est votre racine)
-        if let Some(section) = self.state.config.sections.get_mut(section_idx) {
-            if let Some(mode) = section.modes.get_mut(mode_idx) {
-                if let Some(flavor) = mode.flavors.get_mut(flavor_idx) {
-                    
-                    // --- OPTION A : Injection dans le Step (HashMap) ---
-                    if let Some(step) = flavor.steps.get_mut(step_idx) {
-                        step.values.insert(row_key.to_string(), nouvelle_valeur.clone());
-                        println!("SOLAGE : Dictionnaire du Step '{}' mis à jour -> {} = {}", 
-                            step.name, row_key, nouvelle_valeur);
-                    }
-
-                    // --- OPTION B : Injection dans le WidgetDef (État de l'UI) ---
-                    // for row_def in &mut flavor.row_definitions {
-                    //     if row_def.key == row_key {
-                    //         row_def.widget.value = Some(nouvelle_valeur.clone());
-                    //         println!("SOLAGE : Widget '{}' mis à jour avec la valeur '{}'", 
-                    //             row_def.key, nouvelle_valeur);
-                    //         break; // On arrête de chercher une fois trouvé
-                    //     }
-                    // }
-                }
-            }
-        }
+        println!("SOLAGE : Valeur mise à jour -> {} = {}", row_key, nouvelle_valeur);
     }
 
     /// Évalue un script Rhai en lui donnant accès à toutes les valeurs du Step actuel
@@ -408,11 +399,80 @@ impl eframe::App for SolageApp {
         #[cfg(any(target_arch = "wasm32", target_os = "android"))]
         if let Some(rx) = &self.external_file_rx {
             if let Ok((file_name, content)) = rx.try_recv() {
+                
+                // On charge l'interface en mémoire
                 self.load_yaml_string(&content);
-                self.current_config_path = Some(PathBuf::from(&file_name));
-                if let Ok(saved_state) = load_state(&file_name) {
-                    self.state = saved_state;
+                
+                // 1. LE SECRET POUR ANDROID : On fait une copie locale du YAML !
+                let save_dir = self.backend.get_config_dir();
+                let _ = std::fs::create_dir_all(&save_dir); // Sécurité
+                
+                // On nettoie le nom (au cas où Android renvoie un chemin bizarre)
+                let safe_file_name = std::path::Path::new(&file_name)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                
+                let local_yaml_path = save_dir.join(&safe_file_name);
+                
+                // On écrit la copie du YAML dans notre dossier privé
+                if let Err(e) = std::fs::write(&local_yaml_path, &content) {
+                    log::error!("Erreur de copie locale du YAML : {}", e);
                 }
+                
+                // 2. LA MAGIE : On ajoute NOTRE copie locale aux fichiers récents
+                self.current_config_path = Some(local_yaml_path.clone());
+                self.add_to_recents(local_yaml_path);
+                
+                // 3. On charge les données utilisateur (le JSON)
+                let nom_fichier = std::path::Path::new(&safe_file_name).file_stem().unwrap_or_default().to_string_lossy();
+                let nom_json = format!("{}_data.json", nom_fichier);
+                let safe_save_path = save_dir.join(&nom_json);
+
+                if let Ok(saved_state) = load_state(&safe_save_path.to_string_lossy()) {
+                    self.state = saved_state;
+                    
+                    // Réinjection des données
+                    if let Some(config) = &mut self.config {
+                        for section in &mut config.sections {
+                            for mode in &mut section.modes {
+                                for flavor in &mut mode.flavors {
+                                    let mut noms_des_steps_sauves: Vec<String> = self.state.user_values.keys()
+                                        .filter_map(|k| k.split('_').next().map(|s| s.to_string()))
+                                        .collect();
+                                    
+                                    noms_des_steps_sauves.sort();
+                                    noms_des_steps_sauves.dedup();
+
+                                    // 2. On génère les colonnes manquantes dans l'interface
+                                    for nom_step in &noms_des_steps_sauves {
+                                        if !flavor.steps.iter().any(|s| &s.name == nom_step) {
+                                            flavor.steps.push(Step {
+                                                name: nom_step.clone(),
+                                                values: std::collections::HashMap::new(),
+                                            });
+                                        }
+                                    }
+                                    for step in &mut flavor.steps {
+                                        let prefixe = format!("{}_", step.name);
+                                        for (saved_key, saved_val) in &self.state.user_values {
+                                            if saved_key.starts_with(&prefixe) {
+                                                // On retire le préfixe pour retrouver la clé originale ("width")
+                                                if let Some(cle_originale) = saved_key.strip_prefix(&prefixe) {
+                                                    step.values.insert(cle_originale.to_string(), saved_val.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.state = AppState::default();
+                }
+
                 self.external_file_rx = None;
             }
         }
@@ -495,7 +555,12 @@ impl eframe::App for SolageApp {
             }
         }
 
-        if self.state.config.sections.is_empty() {
+        let afficher_accueil = match &self.config {
+            Some(cfg) => cfg.sections.is_empty(),
+            None => true, // Si pas de config, on affiche l'accueil !
+        };
+
+        if afficher_accueil {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new("🛠️ BUILD: Test API Insets 8")
@@ -644,22 +709,58 @@ impl eframe::App for SolageApp {
             return;
         }
 
+        let config = self.config.as_mut().unwrap();
+
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             if let Some(path) = &self.current_config_path {
+                
+                // 1. Extraction des données
+                // On a SUPPRIMÉ la ligne "if let Some(config) = &self.config {"
+                // On utilise directement le "config" déclaré à la ligne 639 !
+                self.state.user_values.clear();
+                for section in &config.sections {
+                    for mode in &section.modes {
+                        for flavor in &mode.flavors {
+                            for step in &flavor.steps {
+                                for (key, val) in &step.values {
+                                    let cle_absolue = format!("{}_{}", step.name, key);
+                                    self.state.user_values.insert(cle_absolue, val.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Détermination du chemin sécurisé
                 let path_str = path.to_string_lossy().to_string();
                 let state_path = if path_str.starts_with("http") {
-                    path_str
+                    path_str // Web intact
                 } else {
-                    path.with_extension("json").to_string_lossy().to_string()
+                    let nom_fichier = path.file_stem().unwrap_or_default().to_string_lossy();
+                    let nom_json = format!("{}_data.json", nom_fichier);
+                    
+                    let save_dir = self.backend.get_config_dir();
+                    
+                    // Création du dossier sécurisée
+                    if let Err(e) = std::fs::create_dir_all(&save_dir) {
+                        log::error!("Impossible de créer le dossier : {}", e);
+                    }
+                    
+                    save_dir.join(&nom_json).to_string_lossy().to_string()
                 };
-                let _ = save_state(&state_path, &self.state);
-                self.toast = Some(("✅ Projet sauvegardé".to_string(), ctx.input(|i| i.time)));
-                log::info!("Sauvegarde effectuée via raccourci !");
+
+                // 3. Sauvegarde
+                if let Err(e) = save_state(&state_path, &self.state) {
+                    self.error_msg = Some(format!("Erreur de sauvegarde: {}", e));
+                } else {
+                    self.toast = Some(("✅ Projet sauvegardé".to_string(), ctx.input(|i| i.time)));
+                    log::info!("Sauvegarde effectuée via raccourci dans : {}", state_path);
+                }
             }
         }
         
         let mut global_map = HashMap::new();
-        for section in &self.state.config.sections {
+        for section in &config.sections {
             for mode in &section.modes {
                 for flavor in &mode.flavors {
                     for step in &flavor.steps {
@@ -688,24 +789,49 @@ impl eframe::App for SolageApp {
                             let _ = save_state(&state_path, &self.state);
                         }
                         
-                        self.state.config.sections.clear();
+                        config.sections.clear();
                         self.current_config_path = None;
                     }
 
                     if ui.button("💾 Save").clicked() {
+                        // 1. On extrait toutes les valeurs actuellement dans l'interface
+                        self.state.user_values.clear();
+                        for section in &config.sections {
+                            for mode in &section.modes {
+                                for flavor in &mode.flavors {
+                                    for step in &flavor.steps {
+                                        for (key, val) in &step.values {
+                                            let cle_absolue = format!("{}_{}", step.name, key);
+                                            self.state.user_values.insert(cle_absolue, val.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 2. On génère un nom de fichier unique basé sur le YAML source
                         if let Some(path) = &self.current_config_path {
-                            let path_str = path.to_string_lossy().to_string();
-                            let state_path = if path_str.starts_with("http") {
-                                path_str
+                            let nom_fichier = path.file_stem().unwrap_or_default().to_string_lossy();
+                            let nom_json = format!("{}_data.json", nom_fichier);
+                            
+                            let save_dir = self.backend.get_config_dir();
+                            if let Err(e) = std::fs::create_dir_all(&save_dir) {
+                                log::error!("Impossible de créer le dossier de configuration : {}", e);
+                            }
+                            let safe_save_path = save_dir.join(&nom_json);
+
+                            if let Err(e) = save_state(&safe_save_path.to_string_lossy(), &self.state) {
+                                self.error_msg = Some(format!("Erreur: {}", e));
                             } else {
-                                path.with_extension("json").to_string_lossy().to_string()
-                            };
-                            let _ = save_state(&state_path, &self.state);
-                            self.toast = Some(("✅ Projet sauvegardé".to_string(), ctx.input(|i| i.time)));
+                                // Optionnel : on demande le contexte pour le temps si vous avez accès à `ctx`
+                                // self.toast = Some(("✅ Données sauvegardées".to_string(), ctx.input(|i| i.time)));
+                                log::info!("Sauvegarde réussie : {:?}", safe_save_path);
+                            }
                         }
                     }
 
-                    ui.label(format!("{} sections", self.state.config.sections.len()));
+
+                    ui.label(format!("{} sections", config.sections.len()));
                 });
             });
         });
@@ -713,7 +839,7 @@ impl eframe::App for SolageApp {
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Actions :");
-                for action in &self.state.config.actions {
+                for action in &config.actions {
                     if ui.button(&action.label).clicked() {
                         self.engine.run_action(&action.script, &global_map);
                     }
@@ -725,8 +851,8 @@ impl eframe::App for SolageApp {
             egui::TopBottomPanel::bottom("mobile_nav").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let available = ui.available_width();
-                    let btn_width = available / self.state.config.sections.len() as f32;
-                    for (idx, section) in self.state.config.sections.iter().enumerate() {
+                    let btn_width = available / config.sections.len() as f32;
+                    for (idx, section) in config.sections.iter().enumerate() {
                         let is_selected = self.state.nav.section == idx;
                         let label = format!("{}\n{}", section.icon, section.name);
                         if ui.add_sized(
@@ -743,7 +869,7 @@ impl eframe::App for SolageApp {
         } else {
             egui::SidePanel::left("sidebar").show(ctx, |ui| {
                 ui.add_space(10.0);
-                for (idx, section) in self.state.config.sections.iter().enumerate() {
+                for (idx, section) in config.sections.iter().enumerate() {
                     let is_selected = self.state.nav.section == idx;
                     let label = format!("{} {}", section.icon, section.name);
                     if ui.selectable_label(is_selected, label).clicked() {
@@ -789,7 +915,7 @@ impl eframe::App for SolageApp {
                 } else {
                     // C'est ici que la magie opère pour vos cellules !
                     // On envoie la clé et la valeur à votre gestionnaire YAML
-                    self.mettre_a_jour_valeur_yaml(&row_key, nouveau_texte);
+                    self.state.user_values.insert(row_key, nouveau_texte);
                 }
             }
         }
@@ -800,7 +926,7 @@ impl eframe::App for SolageApp {
             }
 
             let s_idx = self.state.nav.section;
-            if let Some(active_section) = self.state.config.sections.get_mut(s_idx) {
+            if let Some(active_section) = config.sections.get_mut(s_idx) {
                 ui.horizontal(|ui| {
                     for (m_idx, mode) in active_section.modes.iter().enumerate() {
                         let is_sel = self.state.nav.mode == m_idx;
@@ -1057,6 +1183,24 @@ fn draw_comparison_table(
                 });
             }
         });
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        if ui.button("➕ Ajouter un Step").clicked() {
+            let nouvel_index = flavor.steps.len() + 1;
+            flavor.steps.push(Step {
+                name: format!("Step {}", nouvel_index),
+                values: std::collections::HashMap::new(),
+            });
+        }
+
+        // Bonus : Un bouton pour retirer le dernier step (si on s'est trompé)
+        if flavor.steps.len() > 1 { // On garde toujours au moins 1 step !
+            if ui.button("🗑️ Retirer le dernier").clicked() {
+                flavor.steps.pop();
+            }
+        }
+    });
 }
 
 fn draw_cell_value(
@@ -1298,30 +1442,12 @@ fn draw_cell_value(
 }
 
 fn update_widget_value(state: &mut AppState, target_key: &str, new_value: String) {
-    for section in &mut state.config.sections {
-        for mode in &mut section.modes {
-            for flavor in &mut mode.flavors {
-                for step in &mut flavor.steps {
-                    // Si on trouve la clé dans les valeurs de l'étape courante, on la met à jour
-                    if step.values.contains_key(target_key) {
-                        step.values.insert(target_key.to_string(), new_value.clone());
-                        return;
-                    }
-                    // Ou on la crée si elle n'y était pas encore
-                    for row in &flavor.row_definitions {
-                        if row.key == target_key {
-                            step.values.insert(target_key.to_string(), new_value.clone());
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Plus besoin de chercher dans l'arbre du YAML ! 
+    // On écrit directement dans le dictionnaire plat de l'utilisateur.
+    state.user_values.insert(target_key.to_string(), new_value);
 }
 
 fn apply_defaults(config: &AppConfig, state: &mut AppState) {
-    state.config = config.clone();
     state.nav.section = 0;
     state.nav.mode = 0;
     state.nav.flavor = 0;
