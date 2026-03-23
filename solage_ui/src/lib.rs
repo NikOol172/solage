@@ -173,6 +173,7 @@ pub struct SolageApp {
     pub theme_applied: bool,
     pub file_dialog: FileDialog,
     pub pending_file_target: Option<FileDialogTarget>,
+    pub resolved_values: std::collections::HashMap<String, String>,
 }
 
 impl SolageApp {
@@ -208,6 +209,7 @@ impl SolageApp {
             theme_applied: false,
             file_dialog: FileDialog::new(),
             pending_file_target: None,
+            resolved_values: HashMap::new()
         }
     }
 
@@ -268,46 +270,74 @@ impl SolageApp {
         }
     }
 
-    /// Reconstructs dynamic columns (Steps) and populates values from saved JSON data.
+    /// Reconstructs dynamic columns (Steps) and populates values from saved JSON data
+    /// using absolute paths (Section/Mode/Flavor/Step/Key).
     fn rehydrate_saved_data(&mut self, config: &mut AppConfig) {
-        // 1. Extract all unique Step names from the saved keys (e.g., "Step 1", "Step 2")
-        let mut saved_step_names = HashSet::new();
+        // --------------------------------------------------------------------
+        // PASS 1 : Identify and reconstruct missing steps in the correct flavors
+        // --------------------------------------------------------------------
+        // Maps a flavor path ("Section/Mode/Flavor") to a set of Step names
+        let mut missing_steps_map: HashMap<String, HashSet<String>> = HashMap::new();
+        
         for key in self.state.user_values.keys() {
-            if let Some(index) = key.find('_') {
-                let step_name = &key[0..index];
-                if step_name.starts_with("Step ") {
-                    saved_step_names.insert(step_name.to_string());
-                }
+            let parts: Vec<&str> = key.split('/').collect();
+            // We only process valid absolute paths
+            if parts.len() == 5 {
+                let flavor_path = format!("{}/{}/{}", parts[0], parts[1], parts[2]);
+                let step_name = parts[3].to_string();
+                
+                missing_steps_map
+                    .entry(flavor_path)
+                    .or_default()
+                    .insert(step_name);
             }
         }
-        
-        let mut sorted_step_names: Vec<String> = saved_step_names.into_iter().collect();
-        sorted_step_names.sort();
 
-        // 2. Reconstruct UI layout & inject data
+        // Reconstruct steps precisely where they belong in the UI tree
         for section in &mut config.sections {
             for mode in &mut section.modes {
                 for flavor in &mut mode.flavors {
+                    let flavor_path = format!("{}/{}/{}", section.name, mode.name, flavor.name);
                     
-                    // A. Create missing columns (Steps) in the UI
-                    for name in &sorted_step_names {
-                        if !flavor.steps.iter().any(|s| s.name == *name) {
-                            flavor.steps.push(Step {
-                                name: name.clone(),
-                                values: HashMap::new(),
-                            });
+                    if let Some(saved_steps) = missing_steps_map.get(&flavor_path) {
+                        // Sort alphabetically so "Step 1" comes before "Step 2"
+                        let mut sorted_step_names: Vec<String> = saved_steps.iter().cloned().collect();
+                        sorted_step_names.sort(); 
+
+                        for name in sorted_step_names {
+                            // If the step doesn't exist in the YAML default, we create it dynamically
+                            if !flavor.steps.iter().any(|s| s.name == name) {
+                                flavor.steps.push(Step {
+                                    name,
+                                    values: HashMap::new(),
+                                    computes: HashMap::new(),
+                                });
+                            }
                         }
                     }
+                }
+            }
+        }
 
-                    // B. Distribute saved values into the correct Step's internal map
-                    for step in &mut flavor.steps {
-                        let prefix = format!("{}_", step.name);
-                        for (saved_key, saved_val) in &self.state.user_values {
-                            if saved_key.starts_with(&prefix) {
-                                // Strip the "Step X_" prefix to recover the original key (e.g., "width")
-                                if let Some(original_key) = saved_key.strip_prefix(&prefix) {
-                                    step.values.insert(original_key.to_string(), saved_val.clone());
-                                }
+        // --------------------------------------------------------------------
+        // PASS 2 : Inject the data into the correctly reconstructed tree
+        // --------------------------------------------------------------------
+        for (saved_key, saved_val) in &self.state.user_values {
+            let parts: Vec<&str> = saved_key.split('/').collect();
+            if parts.len() == 5 {
+                let target_section = parts[0];
+                let target_mode = parts[1];
+                let target_flavor = parts[2];
+                let target_step = parts[3];
+                let widget_key = parts[4];
+
+                // Drill down the config tree to find the exact step
+                if let Some(section) = config.sections.iter_mut().find(|s| s.name == target_section) {
+                    if let Some(mode) = section.modes.iter_mut().find(|m| m.name == target_mode) {
+                        if let Some(flavor) = mode.flavors.iter_mut().find(|f| f.name == target_flavor) {
+                            if let Some(step) = flavor.steps.iter_mut().find(|s| s.name == target_step) {
+                                // Inject the value
+                                step.values.insert(widget_key.to_string(), saved_val.clone());
                             }
                         }
                     }
@@ -392,25 +422,25 @@ impl SolageApp {
         log::debug!("Updated value: {} = {}", absolute_key, new_value);
     }
 
-    /// Evaluates a Rhai script by granting it access to the current Step's values
-    pub fn evaluate_compute_rule(
-        compute_script: &str, 
-        current_step_values: &HashMap<String, String>
-    ) -> Result<String, Box<rhai::EvalAltResult>> {
+    pub fn evaluate_compute_rule(script: &str, global_values: &HashMap<String, String>) -> Result<String, String> {
+        let engine = rhai::Engine::new();
+        let mut scope = rhai::Scope::new();
         
-        let engine = Engine::new();
-        let mut scope = Scope::new();
-
-        let mut rhai_map = Map::new();
-        for (key, value) in current_step_values.iter() {
-            rhai_map.insert(key.clone().into(), Dynamic::from(value.clone()));
+        // 1. On fabrique un véritable dictionnaire dynamique pour Rhai
+        let mut rhai_map = rhai::Map::new();
+        for (k, v) in global_values {
+            // On injecte chaque chemin (ex: "Global/.../width") et sa valeur textuelle
+            rhai_map.insert(k.clone().into(), rhai::Dynamic::from(v.clone()));
         }
         
+        // 2. On injecte ce dictionnaire dans le moteur sous le nom exact "values"
         scope.push("values", rhai_map);
-
-        let result: Dynamic = engine.eval_with_scope(&mut scope, compute_script)?;
-
-        Ok(result.to_string())
+        
+        // 3. On évalue le script avec ce contexte
+        match engine.eval_with_scope::<rhai::Dynamic>(&mut scope, script) {
+            Ok(result) => Ok(result.to_string()),
+            Err(e) => Err(format!("Erreur d'exécution Rhai : {}", e)),
+        }
     }
 
     // ========================================================================
@@ -428,7 +458,19 @@ impl SolageApp {
                 for flavor in &mode.flavors {
                     for step in &flavor.steps {
                         for (key, val) in &step.values {
-                            let absolute_key = format!("{}_{}", step.name, key);
+                            
+                            // --- LA MAGIE DES CHEMINS ABSOLUS OPÈRE ICI ---
+                            // On crée une adresse unique de type URI / DAG Path
+                            // Ex: "Assets/Modeling/Prop/Step 1/width"
+                            let absolute_key = format!(
+                                "{}/{}/{}/{}/{}", 
+                                section.name, 
+                                mode.name, 
+                                flavor.name, 
+                                step.name, 
+                                key
+                            );
+                            
                             self.state.user_values.insert(absolute_key, val.clone());
                         }
                     }
@@ -471,6 +513,9 @@ impl SolageApp {
     // ========================================================================
 
     fn handle_async_events(&mut self, ctx: &egui::Context) {
+        // NOUVEAU : Le drapeau pour avertir l'interface qu'une donnée asynchrone est arrivée
+        let mut needs_sync = false;
+
         // --- 1. Desktop File Dialog ---
         #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
         {
@@ -482,6 +527,7 @@ impl SolageApp {
                         FileDialogTarget::WidgetPath(key) => {
                             let path_str = path.display().to_string();
                             self.update_user_value(&key, path_str);
+                            needs_sync = true; // <-- ON LÈVE LE DRAPEAU
                         }
                     }
                 }
@@ -561,11 +607,14 @@ impl SolageApp {
         // --- 5. Android Text Input Queue ---
         #[cfg(target_os = "android")]
         if let Ok(mut queue) = PENDING_TEXT_INPUTS.lock() {
-            for (row_key, new_text) in queue.drain(..) {
-                if row_key == "url_input" {
-                    self.url_input = new_text;
-                } else {
-                    self.update_user_value(&row_key, new_text);
+            if !queue.is_empty() {
+                for (row_key, new_text) in queue.drain(..) {
+                    if row_key == "url_input" {
+                        self.url_input = new_text;
+                    } else {
+                        self.update_user_value(&row_key, new_text);
+                        needs_sync = true; // <-- ON LÈVE LE DRAPEAU
+                    }
                 }
             }
         }
@@ -573,8 +622,24 @@ impl SolageApp {
         // --- 6. Android File Selection Queue ---
         #[cfg(target_os = "android")]
         if let Ok(mut queue) = crate::PENDING_FILE_SELECTIONS.lock() {
-            for (row_key, uri) in queue.drain(..) {
-                self.update_user_value(&row_key, uri);
+            if !queue.is_empty() {
+                for (row_key, uri) in queue.drain(..) {
+                    self.update_user_value(&row_key, uri);
+                    needs_sync = true; // <-- ON LÈVE LE DRAPEAU
+                }
+            }
+        }
+
+        // ====================================================================
+        // LA LIGNE MAGIQUE DE SYNCHRONISATION
+        // ====================================================================
+        if needs_sync {
+            // On contourne le Borrow Checker avec "take()" pour sortir temporairement 
+            // la configuration, la mettre à jour avec les nouvelles données du "state", 
+            // puis la remettre à sa place.
+            if let Some(mut cfg) = self.config.take() {
+                self.rehydrate_saved_data(&mut cfg);
+                self.config = Some(cfg);
             }
         }
     }
@@ -722,7 +787,97 @@ impl SolageApp {
             }
         }
     }
+
+    // ========================================================================
+    // MOTEUR DE CALCUL RÉACTIF
+    // ========================================================================
+    pub fn recalculate_all_compute_rules(&mut self) {
+        let Some(config) = &mut self.config else { return; };
+
+        // 1. On construit le dictionnaire brut avec les valeurs littérales (y compris les "=...")
+        let mut raw_values = HashMap::new();
+        for section in &config.sections {
+            for mode in &section.modes {
+                for flavor in &mode.flavors {
+                    for step in &flavor.steps {
+                        for (key, val) in &step.values {
+                            let abs_key = format!("{}/{}/{}/{}/{}", section.name, mode.name, flavor.name, step.name, key);
+                            raw_values.insert(abs_key, val.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. RÉSOLUTION DES LIENS DYNAMIQUES (Le parseur de références)
+        let mut global_values = raw_values.clone();
+        
+        for (abs_key, val) in global_values.iter_mut() {
+            if val.starts_with('=') {
+                let mut current_val = val.clone();
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(abs_key.clone()); // On mémorise le point de départ
+
+                // On remonte la chaîne tant qu'on trouve un signe '='
+                while let Some(target) = current_val.strip_prefix('=') {
+                    let target_str = target.to_string();
+                    
+                    // Sécurité anti-crash : détection de boucle infinie (A -> B -> A)
+                    if visited.contains(&target_str) {
+                        log::error!("Boucle infinie détectée sur la clé : {}", abs_key);
+                        current_val = "0".to_string();
+                        break;
+                    }
+                    visited.insert(target_str.clone());
+
+                    // On cherche la valeur cible dans le dictionnaire brut
+                    if let Some(target_val) = raw_values.get(&target_str) {
+                        current_val = target_val.clone();
+                    } else {
+                        // Le lien pointe vers une case qui n'existe pas ou a été supprimée
+                        current_val = "0".to_string(); 
+                        break;
+                    }
+                }
+                
+                // On écrase la formule par sa valeur finale résolue pour Rhai
+                *val = current_val;
+            }
+        }
+
+        // 3. On passe sur toutes les règles de calcul Rhai
+        for section in &mut config.sections {
+            for mode in &mut section.modes {
+                for flavor in &mut mode.flavors {
+                    for step in &mut flavor.steps {
+                        for row_def in &flavor.row_definitions {
+                            // LA MAGIE EST ICI : On cherche d'abord dans le Step, sinon dans le RowDef
+                            let active_script = step.computes.get(&row_def.key)
+                                .or(row_def.widget.compute.as_ref());
+
+                            if let Some(script) = active_script {
+                                match SolageApp::evaluate_compute_rule(script, &global_values) {
+                                    Ok(result) => {
+                                        step.values.insert(row_def.key.clone(), result.clone());
+                                        let abs_key = format!("{}/{}/{}/{}/{}", section.name, mode.name, flavor.name, step.name, row_def.key);
+                                        global_values.insert(abs_key, result);
+                                    }
+                                    Err(e) => {
+                                        println!("🛑 ERREUR RHAI pour '{}': {}", row_def.key, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.resolved_values = global_values;
+
+    }
 }
+
 impl eframe::App for SolageApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let is_mobile = ctx.content_rect().width() < 600.0;
@@ -768,20 +923,32 @@ impl eframe::App for SolageApp {
             // 1. LES DRAPEAUX D'ACTION
             let mut action_save = false;
             let mut action_close = false;
+            let mut action_compute = false;
             
             // 2. LE BLOC D'EMPRUNT (Scope)
             // On enferme la lecture de `config` et le dessin de l'interface dans un bloc { }
             {
                 let config = self.config.as_mut().unwrap();
 
-                // Build Rhai global context
+                // Build Rhai global context with Absolute Paths
                 let mut global_values = HashMap::new();
                 for section in &config.sections {
                     for mode in &section.modes {
                         for flavor in &mode.flavors {
                             for step in &flavor.steps {
                                 for (key, val) in &step.values {
-                                    global_values.insert(key.clone(), val.clone());
+                                    // On génère la même adresse unique (URI) que pour la sauvegarde
+                                    let absolute_key = format!(
+                                        "{}/{}/{}/{}/{}", 
+                                        section.name, 
+                                        mode.name, 
+                                        flavor.name, 
+                                        step.name, 
+                                        key
+                                    );
+                                    
+                                    // Le moteur Rhai a maintenant accès à l'arbre complet !
+                                    global_values.insert(absolute_key, val.clone());
                                 }
                             }
                         }
@@ -908,24 +1075,45 @@ impl eframe::App for SolageApp {
                                             ui.selectable_value(&mut self.state.nav.flavor, i, &f.name);
                                         }
                                     });
-                            });
+
+                                if let Some(active_flavor) = active_mode.flavors.get_mut(self.state.nav.flavor) {
+                                    ui.add_space(15.0); // Un petit espace visuel
+                                    
+                                    if ui.button("➕ Add Step").clicked() {
+                                        let new_index = active_flavor.steps.len() + 1;
+                                        active_flavor.steps.push(Step {
+                                            name: format!("Step {}", new_index),
+                                            values: std::collections::HashMap::new(),
+                                            computes: std::collections::HashMap::new(),
+                                        });
+                                    }
+
+                                }
+                            }); 
                             
                             let flavor_idx = self.state.nav.flavor;
                             if let Some(active_flavor) = active_mode.flavors.get_mut(flavor_idx) {
+                                let base_path = format!("{}/{}/{}", active_section.name, active_mode.name, active_flavor.name);
+                                
                                 if is_mobile {
-                                    draw_single_step(ui, active_flavor, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &mut self.state.nav);
+                                    action_compute = draw_single_step(ui, active_flavor, &base_path, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &mut self.state.nav, &self.resolved_values);
                                 } else {
-                                    draw_comparison_table(ui, active_flavor, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target);
+                                    action_compute = draw_comparison_table(ui, active_flavor, &base_path, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &self.resolved_values);
                                 }
                             }
                         }
                     }
+
                 });
                 
             } // <-- 3. L'accolade se ferme ici ! L'écran est dessiné, `config` est libéré.
 
             // 4. L'EXÉCUTION DES DRAPEAUX
             // Maintenant que nous avons l'accès exclusif à `self`, on peut appeler nos méthodes.
+            if action_compute {
+                println!("action compute '{}'", action_compute);
+                self.recalculate_all_compute_rules();
+            }
             if action_save {
                 self.save_current_project(ctx);
             }
@@ -992,80 +1180,194 @@ fn draw_splash_anim(ctx: &egui::Context, time: f64) {
 fn draw_single_step(
     ui: &mut Ui,
     flavor: &mut Flavor,
+    base_path: &str,
     _script_context: &mut ScriptContext,
     engine: &ScriptEngine,
     file_dialog: &mut egui_file_dialog::FileDialog,
     pending_target: &mut Option<FileDialogTarget>,
     nav: &mut NavState,
-) {
+    resolved_values: &std::collections::HashMap<String, String>,
+) -> bool {
+    let mut ui_changed = false;
+    
+    // 1. LA DÉCLARATION EST ICI AUSSI
+    let mut step_to_remove: Option<usize> = None;
+    
     if flavor.steps.is_empty() {
         ui.colored_label(Color32::GRAY, "No steps defined");
-        return;
+        return false;
     }
 
     let step_count = flavor.steps.len();
     let current = nav.step.min(step_count.saturating_sub(1));
 
     ui.horizontal(|ui| {
-        if ui.button("◀").clicked() && current > 0 {
-            nav.step -= 1;
-        }
-        ui.strong(RichText::new(&flavor.steps[current].name)
-            .size(16.0)
-            .color(Color32::from_rgb(100, 180, 255)));
-        if ui.button("▶").clicked() && current < step_count - 1 {
-            nav.step += 1;
-        }
+        if ui.button("◀").clicked() && current > 0 { nav.step -= 1; }
+        
+        ui.strong(RichText::new(&flavor.steps[current].name).size(16.0).color(Color32::from_rgb(100, 180, 255)));
+        
+        // 2. LE MENU CONTEXTUEL
+        ui.menu_button("...", |ui| {
+            if ui.button("X Remove Step").clicked() {
+                step_to_remove = Some(current);
+                ui.close_menu();
+            }
+        });
+
+        if ui.button("▶").clicked() && current < step_count - 1 { nav.step += 1; }
         ui.label(format!("{}/{}", current + 1, step_count));
     });
     ui.separator();
 
     let step = &mut flavor.steps[current];
     for row_def in &flavor.row_definitions {
-        ui.horizontal(|ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(&row_def.label);
+        
+        // On récupère la valeur existante ou on l'initialise
+        let value = step.values.entry(row_def.key.clone()).or_insert_with(|| {
+            row_def.widget.default.as_ref().map(|d| match d {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => String::new(),
+            }).unwrap_or_default()
+        });
             
-            let value = step.values
-                .entry(row_def.key.clone())
-                .or_insert_with(|| {
-                    row_def.widget.default.as_ref()
-                        .map(|d| match d {
-                            serde_json::Value::String(s) => s.clone(),
-                            serde_json::Value::Number(n) => n.to_string(),
-                            serde_json::Value::Bool(b) => b.to_string(),
-                            _ => String::new(),
-                        })
-                        .unwrap_or_default()
-                });
-                
-            let has_changed = draw_cell_value(ui, value, &row_def.widget, &row_def.key, engine, file_dialog, pending_target);
+        let absolute_key = format!("{}/{}/{}", base_path, step.name, row_def.key);
+        let mut cell_changed = false;
 
-            if has_changed {
-                for other_row in &flavor.row_definitions {
-                    if let Some(rhai_script) = other_row.widget.compute_rule() {
-                        if let Ok(new_result) = SolageApp::evaluate_compute_rule(rhai_script, &step.values) {
-                            log::debug!("Rhai compute successful for {}: {}", other_row.key, new_result);
-                            step.values.insert(other_row.key.clone(), new_result);
-                        }
+        let row_response = ui.horizontal(|ui| {
+            ui.set_min_width(ui.available_width());
+            
+            // --- A. LA SOURCE DU GLISSEMENT ---
+            let handle = ui.add(egui::Label::new("⠿").sense(egui::Sense::drag()));
+            if handle.dragged() {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+            }
+            handle.dnd_set_drag_payload(std::sync::Arc::new(value.clone()));
+            
+            ui.label(&row_def.label);
+
+            // --- L'INTERCEPTION INTELLIGENTE ---
+            let is_reference = value.starts_with('=');
+            let is_local_compute = step.computes.contains_key(&row_def.key);
+            let has_global_compute = row_def.widget.compute.is_some();
+            let has_compute = is_local_compute || has_global_compute;
+
+            if is_reference || has_compute {
+                let display_val = if is_reference {
+                    resolved_values.get(&absolute_key).cloned().unwrap_or_else(|| "0".to_string())
+                } else {
+                    value.clone()
+                };
+
+                if is_reference {
+                    if ui.button("🔗").on_hover_text("Cliquer pour casser le lien (Bake)").clicked() {
+                        *value = display_val.clone();
+                        cell_changed = true;
                     }
+                } else {
+                    // CHANGEMENT D'ICÔNE : 🛠 si c'est local, ⚙ si c'est global
+                    let icon = if is_local_compute { "🛠" } else { "⚙" };
+                    
+                    ui.menu_button(icon, |ui| {
+                        if is_local_compute {
+                            ui.strong("Script Local (Surcharge)");
+                        } else {
+                            ui.label("Script Global (Hérité)");
+                        }
+                        
+                        // On récupère le texte à éditer (priorité locale)
+                        let mut script_to_edit = step.computes.get(&row_def.key)
+                            .cloned()
+                            .or_else(|| row_def.widget.compute.clone())
+                            .unwrap_or_default();
+
+                        // L'éditeur texte
+                        if ui.add(egui::TextEdit::multiline(&mut script_to_edit)
+                            .desired_width(250.0)
+                            .font(egui::TextStyle::Monospace))
+                            .changed() 
+                        {
+                            // Dès qu'on tape une lettre, on l'enregistre dans le STEP (Surcharge locale !)
+                            step.computes.insert(row_def.key.clone(), script_to_edit);
+                            cell_changed = true;
+                        }
+                        
+                        ui.separator();
+                        
+                        if is_local_compute {
+                            // Bouton pour détruire la surcharge et revenir au global
+                            if ui.button("🗑 Supprimer la surcharge locale").clicked() {
+                                step.computes.remove(&row_def.key);
+                                cell_changed = true;
+                                ui.close_menu();
+                            }
+                        }
+                    }).response.on_hover_text(if is_local_compute { "Modifier la surcharge" } else { "Créer une surcharge locale" });
                 }
+
+                let tooltip_text = if is_reference { format!("Lié à : {}", value) } else { "Calcul dynamique".to_string() };
+                ui.strong(egui::RichText::new(&display_val).color(egui::Color32::from_rgb(100, 180, 255)))
+                    .on_hover_text(tooltip_text);
+                    
+            } else {
+                cell_changed |= draw_cell_value(ui, value, &row_def.widget, &absolute_key, engine, file_dialog, pending_target);
             }
         });
+
+        // --- B. LA ZONE DE RÉCEPTION ---
+        let drop_zone = row_response.response;
+
+        if drop_zone.dnd_hover_payload::<std::sync::Arc<String>>().is_some() {
+            ui.painter().rect_stroke(
+                drop_zone.rect.expand(2.0),
+                2.0,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 255, 100)),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        if let Some(dropped_value) = drop_zone.dnd_release_payload::<std::sync::Arc<String>>() {
+            *value = dropped_value.to_string();
+            cell_changed = true;
+        }
+
+        if cell_changed {
+            ui_changed = true;
+        }
     }
+
+    // 3. LA SUPPRESSION : Tout en bas
+    if let Some(idx) = step_to_remove {
+        flavor.steps.remove(idx);
+        if nav.step >= flavor.steps.len() && nav.step > 0 {
+            nav.step -= 1;
+        }
+        ui_changed = true;
+    }
+
+    ui_changed
 }
 
 fn draw_comparison_table(
     ui: &mut Ui, 
     flavor: &mut Flavor, 
+    base_path: &str, 
     _script_context: &mut ScriptContext, 
     engine: &ScriptEngine, 
     file_dialog: &mut egui_file_dialog::FileDialog,
     pending_target: &mut Option<FileDialogTarget>,
-) {
+    resolved_values: &std::collections::HashMap<String, String>,
+) -> bool {
+    let mut ui_changed = false;
+    
+    // 1. LA DÉCLARATION EST ICI : Tout en haut, visible par toute la fonction !
+    let mut step_to_remove: Option<usize> = None;
+    let mut step_to_move: Option<(usize, usize)> = None;
+
     if flavor.steps.is_empty() {
         ui.colored_label(Color32::GRAY, "No steps defined");
-        return;
+        return false;
     }
 
     let mut builder = TableBuilder::new(ui)
@@ -1082,67 +1384,218 @@ fn draw_comparison_table(
             header.col(|ui| { 
                 ui.strong(RichText::new("Parameter").color(Color32::WHITE)); 
             });
-            for step in &flavor.steps {
+            
+            for (step_idx, step) in flavor.steps.iter().enumerate() {
                 header.col(|ui| { 
-                    ui.strong(RichText::new(&step.name).color(Color32::from_rgb(100, 180, 255))); 
+                    
+                    // 1. On encapsule tout le titre dans une "response" pour en faire une zone de Drop
+                    let response = ui.horizontal(|ui| {
+                        
+                        // A. La poignée de Drag (Pour DÉPLACER LA COLONNE)
+                        let handle = ui.add(egui::Label::new(" :: ").sense(egui::Sense::drag()))
+                            .on_hover_cursor(egui::CursorIcon::Grab)
+                            .on_hover_text("Glisser pour déplacer la colonne"); // Texte corrigé !
+
+                        if handle.dragged() {
+                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+                        }
+
+                        // LA CORRECTION EST ICI : Le payload est juste l'index de la colonne (step_idx)
+                        handle.dnd_set_drag_payload(std::sync::Arc::new(step_idx));
+
+                        // B. Le Titre et le Menu (Intacts)
+                        ui.strong(RichText::new(&step.name).color(Color32::from_rgb(100, 180, 255)));
+                        ui.menu_button("...", |ui| {
+                            if ui.button("X Remove Step").clicked() {
+                                step_to_remove = Some(step_idx);
+                                ui.close_menu();
+                            }
+                        });
+                    }).response;
+
+                    // 2. Feedback Visuel (Orange pour différencier du Vert/Bleu des cellules)
+                    if response.dnd_hover_payload::<std::sync::Arc<usize>>().is_some() {
+                        ui.painter().rect_stroke(
+                            response.rect.expand(2.0),
+                            2.0,
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 150, 50)), // Orange
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+
+                    // 3. Réception du Drop (Réagencement des colonnes)
+                    if let Some(source_idx) = response.dnd_release_payload::<std::sync::Arc<usize>>() {
+                        // On enregistre (De, Vers) pour faire le mouvement à la fin
+                        step_to_move = Some((**source_idx, step_idx));
+                    }
                 });
             }
         })
         .body(|mut body| {
             for row_def in &flavor.row_definitions {
                 body.row(24.0, |mut strip| {
+                    
+                    // 1. La première colonne : le nom du paramètre (Label)
                     strip.col(|ui| { ui.label(&row_def.label); });
 
+                    // 2. Les colonnes suivantes : les valeurs pour chaque Step
                     for step in &mut flavor.steps {
                         strip.col(|ui| {
-                            let value = step.values
-                                .entry(row_def.key.clone())
-                                .or_insert_with(|| {
-                                    row_def.widget.default
-                                        .as_ref()
-                                        .map(|d| match d {
-                                            serde_json::Value::String(s) => s.clone(),
-                                            serde_json::Value::Number(n) => n.to_string(),
-                                            serde_json::Value::Bool(b) => b.to_string(),
-                                            _ => String::new(),
-                                        })
-                                        .unwrap_or_default()
-                                });
+                            
+                            // A. ON CRÉE LES VARIABLES DANS LE SCOPE DE LA CELLULE
+                            let value = step.values.entry(row_def.key.clone()).or_insert_with(|| {
+                                row_def.widget.default.as_ref().map(|d| match d {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    serde_json::Value::Number(n) => n.to_string(),
+                                    serde_json::Value::Bool(b) => b.to_string(),
+                                    _ => String::new(),
+                                }).unwrap_or_default()
+                            });
 
-                            let has_changed = draw_cell_value(ui, value, &row_def.widget, &row_def.key, engine, file_dialog, pending_target);
+                            let absolute_key = format!("{}/{}/{}", base_path, step.name, row_def.key);
+                            let mut cell_changed = false;
 
-                            if has_changed {
-                                for other_row in &flavor.row_definitions {
-                                    if let Some(rhai_script) = other_row.widget.compute_rule() {
-                                        if let Ok(new_result) = SolageApp::evaluate_compute_rule(rhai_script, &step.values) {
-                                            log::debug!("Rhai compute successful for {}: {}", other_row.key, new_result);
-                                            step.values.insert(other_row.key.clone(), new_result);
-                                        }
-                                    }
+                            // B. ON DESSINE LA CELLULE (Poignée + Widget)
+                            let cell_response = ui.horizontal(|ui| {
+                                let handle = ui.add(egui::Label::new(" :: ").sense(egui::Sense::drag()))
+                                    .on_hover_cursor(egui::CursorIcon::Grab)
+                                    .on_hover_text("Glisser : Copier | Shift+Glisser : Lier");
+
+                                if handle.dragged() {
+                                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
                                 }
+
+                                // Ici, les variables existent parfaitement !
+                                let payload_data = (absolute_key.clone(), value.clone());
+                                handle.dnd_set_drag_payload(std::sync::Arc::new(payload_data));
+
+                                // --- L'INTERCEPTION INTELLIGENTE ---
+                                let is_reference = value.starts_with('=');
+                                let is_local_compute = step.computes.contains_key(&row_def.key);
+                                let has_global_compute = row_def.widget.compute.is_some();
+                                let has_compute = is_local_compute || has_global_compute;
+
+                                if is_reference || has_compute {
+                                    let display_val = if is_reference {
+                                        resolved_values.get(&absolute_key).cloned().unwrap_or_else(|| "0".to_string())
+                                    } else {
+                                        value.clone()
+                                    };
+
+                                    if is_reference {
+                                        if ui.button("🔗").on_hover_text("Cliquer pour casser le lien (Bake)").clicked() {
+                                            *value = display_val.clone();
+                                            cell_changed = true;
+                                        }
+                                    } else {
+                                        // CHANGEMENT D'ICÔNE : 🛠 si c'est local, ⚙ si c'est global
+                                        let icon = if is_local_compute { "🛠" } else { "⚙" };
+                                        
+                                        ui.menu_button(icon, |ui| {
+                                            if is_local_compute {
+                                                ui.strong("Script Local (Surcharge)");
+                                            } else {
+                                                ui.label("Script Global (Hérité)");
+                                            }
+                                            
+                                            // On récupère le texte à éditer (priorité locale)
+                                            let mut script_to_edit = step.computes.get(&row_def.key)
+                                                .cloned()
+                                                .or_else(|| row_def.widget.compute.clone())
+                                                .unwrap_or_default();
+
+                                            // L'éditeur texte
+                                            if ui.add(egui::TextEdit::multiline(&mut script_to_edit)
+                                                .desired_width(250.0)
+                                                .font(egui::TextStyle::Monospace))
+                                                .changed() 
+                                            {
+                                                // Dès qu'on tape une lettre, on l'enregistre dans le STEP (Surcharge locale !)
+                                                step.computes.insert(row_def.key.clone(), script_to_edit);
+                                                cell_changed = true;
+                                            }
+                                            
+                                            ui.separator();
+                                            
+                                            if is_local_compute {
+                                                // Bouton pour détruire la surcharge et revenir au global
+                                                if ui.button("🗑 Supprimer la surcharge locale").clicked() {
+                                                    step.computes.remove(&row_def.key);
+                                                    cell_changed = true;
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        }).response.on_hover_text(if is_local_compute { "Modifier la surcharge" } else { "Créer une surcharge locale" });
+                                    }
+
+                                    let tooltip_text = if is_reference { format!("Lié à : {}", value) } else { "Calcul dynamique".to_string() };
+                                    ui.strong(egui::RichText::new(&display_val).color(egui::Color32::from_rgb(100, 180, 255)))
+                                        .on_hover_text(tooltip_text);
+                                        
+                                } else {
+                                    cell_changed |= draw_cell_value(ui, value, &row_def.widget, &absolute_key, engine, file_dialog, pending_target);
+                                }
+                            });
+
+                            // C. LA LOGIQUE DE DROP (Réception)
+                            let drop_zone = cell_response.response;
+
+                            if drop_zone.dnd_hover_payload::<std::sync::Arc<(String, String)>>().is_some() {
+                                let is_link = ui.input(|i| i.modifiers.shift);
+                                let stroke_color = if is_link { 
+                                    egui::Color32::from_rgb(100, 180, 255) // Bleu pour Lier
+                                } else { 
+                                    egui::Color32::from_rgb(100, 255, 100) // Vert pour Copier
+                                };
+                                
+                                ui.painter().rect_stroke(
+                                    drop_zone.rect.expand(2.0),
+                                    2.0,
+                                    egui::Stroke::new(2.0, stroke_color),
+                                    egui::StrokeKind::Inside,
+                                );
                             }
-                        });
-                    }
-                });
-            }
-        });
 
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        if ui.button("➕ Add Step").clicked() {
-            let new_index = flavor.steps.len() + 1;
-            flavor.steps.push(Step {
-                name: format!("Step {}", new_index),
-                values: std::collections::HashMap::new(),
-            });
-        }
+                            if let Some(payload) = drop_zone.dnd_release_payload::<std::sync::Arc<(String, String)>>() {
+                                let (source_path, source_value) = &**payload;
+                                if ui.input(|i| i.modifiers.shift) {
+                                    *value = format!("={}", source_path); // On lie
+                                } else {
+                                    *value = source_value.clone();        // On copie purement
+                                }
+                                cell_changed = true;
+                            }
 
-        if flavor.steps.len() > 1 { 
-            if ui.button("🗑️ Remove Last").clicked() {
-                flavor.steps.pop();
-            }
+                            if cell_changed {
+                                ui_changed = true;
+                            }
+                        }); // Fin de la colonne (strip.col)
+                    } // Fin de la boucle des steps
+                }); // Fin de la ligne (body.row)
+            } // Fin de la boucle des row_definitions
+        }); // Fin du .body
+
+    // 3. LA SUPPRESSION : Tout en bas
+    if let Some(idx) = step_to_remove {
+        flavor.steps.remove(idx);
+        ui_changed = true;
+    }
+
+    if let Some((from_idx, to_idx)) = step_to_move {
+        if from_idx != to_idx {
+            // On retire la colonne de son ancienne place
+            let step = flavor.steps.remove(from_idx);
+            
+            // On la réinsère à sa nouvelle place (en s'assurant de ne pas dépasser la taille)
+            flavor.steps.insert(to_idx.min(flavor.steps.len()), step);
+            
+            // On lève le drapeau pour que Rhai recalcule tout, car les variables absolues
+            // ont changé de nom (Step 1 est devenu Step 2, etc.) !
+            ui_changed = true; 
         }
-    });
+    }
+    
+    ui_changed
 }
 
 // ============================================================================
