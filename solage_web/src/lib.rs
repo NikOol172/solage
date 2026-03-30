@@ -1,9 +1,6 @@
 // solage_web/src/lib.rs
 
 use wasm_bindgen::prelude::*;
-use solage_core::NoAuth;
-use solage_ui::SolageApp;
-use std::path::PathBuf;
 
 #[cfg(target_arch = "wasm32")]
 use solage_core::PlatformBackend;

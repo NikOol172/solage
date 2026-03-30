@@ -14,19 +14,19 @@ members = [
 solage_data = { path = "./solage_data" }
 solage_core = { path = "./solage_core" }
 solage_ui   = { path = "./solage_ui" }
-getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom = { version = "0.2", features = ["js"] }
 
 # Sérialisation
 serde       = { version = "1.0", features = ["derive"] }
 serde_json  = "1.0"
-serde_yml   = "0.0.12"          # ← Remplace serde_yaml déprécié
+serde_yaml   = "0.9"
 
 # UI
 egui        = "0.33"
 egui_extras = { version = "0.33"}
 egui-file-dialog = "0.12"
 eframe      = { version = "0.33" }
-ehttp       = "0.6"
+ehttp       = "0.7"
 jni         = "0.21"   
 ndk-context = "0.1"
 
@@ -37,9 +37,25 @@ rhai        = "1.24"
 anyhow      = "1.0"
 log         = "0.4"
 
+
+
 [profile.release]
 opt-level     = "z"
 lto           = true
 codegen-units = 1
 panic         = "abort"
 strip         = true
+
+# --- OPTIMISATIONS DE DÉVELOPPEMENT ---
+
+[profile.dev]
+opt-level = 0
+debug = 0 # 🛑 Coupe les symboles de debug lourds (Sauve énormément de RAM au linking)
+codegen-units = 256 # Parallélise la compilation au maximum
+
+# Le secret des développeurs Egui : 
+# On dit à Cargo d'optimiser au maximum TOUTES les librairies externes (egui, rhai...).
+# Ça prendra 1 minute la première fois, mais ensuite vos "cargo run" seront quasi instantanés
+# car votre code sera le seul à être recompilé, et le Linker aura beaucoup moins de code à digérer.
+[profile.dev.package."*"]
+opt-level = 3

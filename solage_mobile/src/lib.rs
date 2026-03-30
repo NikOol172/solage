@@ -8,8 +8,10 @@ use std::sync::mpsc::Sender;
 use android_activity::AndroidApp;
 
 // NOUVEAU : Une variable globale pour stocker notre canal le temps que l'utilisateur choisisse son fichier
+#[allow(dead_code)]
 static FILE_SENDER: Mutex<Option<Sender<(String, String)>>> = Mutex::new(None);
 
+#[allow(dead_code)]
 struct MobileBackend {
     data_dir: PathBuf,
     #[cfg(target_os = "android")]
@@ -64,24 +66,45 @@ impl PlatformBackend for MobileBackend {
 }
 
 // --- CALLBACK JNI : Fonction appelée par Android/Java une fois le fichier sélectionné ---
+// On importe le Mutex global depuis l'UI
+use solage_ui::PENDING_TEXT_INPUTS;
+
+// --- CALLBACK 1 : SÉLECTION DE FICHIER ---
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_cloudcompositing_solage_MainActivity_onFileSelected(
     mut env: jni::JNIEnv,
-    _class: jni::objects::JClass,
+    _this: jni::objects::JObject, // <-- CORRIGÉ : JObject pour correspondre à l'instance
     name: jni::objects::JString,
     content: jni::objects::JString,
 ) {
-    // 1. On convertit les chaînes Java en chaînes Rust
     if let (Ok(name_str), Ok(content_str)) = (env.get_string(&name), env.get_string(&content)) {
         let file_name: String = name_str.into();
         let file_content: String = content_str.into();
 
-        // 2. On récupère notre canal (Sender) mis en attente et on envoie les données à egui !
         if let Ok(mut sender_guard) = FILE_SENDER.lock() {
             if let Some(tx) = sender_guard.take() {
                 let _ = tx.send((file_name, file_content));
             }
+        }
+    }
+}
+
+// --- CALLBACK 2 : SAISIE DE TEXTE ---
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_cloudcompositing_solage_MainActivity_onTextEntered(
+    mut env: jni::JNIEnv,
+    _this: jni::objects::JObject, // <-- PARFAIT : JObject
+    j_row_key: jni::objects::JString,
+    j_text: jni::objects::JString,
+) {
+    if let (Ok(row_key_str), Ok(text_str)) = (env.get_string(&j_row_key), env.get_string(&j_text)) {
+        let row_key: String = row_key_str.into();
+        let text: String = text_str.into();
+
+        if let Ok(mut queue) = PENDING_TEXT_INPUTS.lock() {
+            queue.push((row_key, text));
         }
     }
 }
@@ -113,7 +136,7 @@ fn android_main(app: AndroidApp) {
         Box::new(move |cc| {
             // NOUVEAU : On passe l'app (qui contient le pointeur JNI) au Backend
             let backend = MobileBackend { data_dir, app: app.clone() };
-            let mut solage_app = SolageApp::new(cc, Box::new(backend), Box::new(NoAuth::new()));
+            let solage_app = SolageApp::new(cc, Box::new(backend), Box::new(NoAuth::new()));
             Ok(Box::new(solage_app))
         }),
     ).unwrap();

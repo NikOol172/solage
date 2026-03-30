@@ -1,13 +1,13 @@
 [package]
 name = "solage_core"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 solage_data = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
-serde_yml   = { workspace = true }
+serde_yaml   = { workspace = true }
 rhai        = { workspace = true }
 log         = { workspace = true }
 anyhow      = { workspace = true }

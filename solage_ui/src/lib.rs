@@ -5,7 +5,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet}; // Added HashSet for rehydration
 use std::sync::mpsc::Receiver;
-use rhai::{Engine, Scope, Map, Dynamic};
 use std::sync::Mutex;
 
 use solage_data::{AppConfig, NavState, WidgetDef, Flavor, Step, AppState, GlobalPreferences, WidgetType as SolageWidget}; 
@@ -77,54 +76,6 @@ pub fn request_android_text_input(current_text: &str, row_key: &str) {
     }
 }
 
-/// Queue for pending file selections from Android's native file picker
-pub static PENDING_FILE_SELECTIONS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
-
-/// Callback triggered by Android when a file is selected
-#[cfg(target_os = "android")]
-#[no_mangle]
-pub extern "C" fn Java_com_cloudcompositing_solage_MainActivity_onFileSelected(
-    mut env: jni::JNIEnv,
-    _this: jni::objects::JObject,
-    j_row_key: jni::objects::JString,
-    j_uri: jni::objects::JString,
-) {
-    let row_key: String = env.get_string(&j_row_key).map(|s| s.into()).unwrap_or_default();
-    let uri: String = env.get_string(&j_uri).map(|s| s.into()).unwrap_or_default();
-
-    if let Ok(mut queue) = crate::PENDING_FILE_SELECTIONS.lock() {
-        queue.push((row_key, uri));
-    }
-}
-
-/// Requests the native file picker on Android
-#[cfg(target_os = "android")]
-pub fn request_android_file_picker(row_key: &str) {
-    let ctx = ndk_context::android_context();
-    let vm_ptr = ctx.vm();
-    let context_ptr = ctx.context();
-
-    if vm_ptr.is_null() || context_ptr.is_null() { return; }
-
-    unsafe {
-        if let Ok(jvm) = jni::JavaVM::from_raw(vm_ptr.cast()) {
-            let mut env = match jvm.get_env() {
-                Ok(e) => e,
-                Err(_) => jvm.attach_current_thread_permanently().unwrap(),
-            };
-
-            let activity = jni::objects::JObject::from_raw(context_ptr.cast());
-            if let Ok(j_key) = env.new_string(row_key) {
-                let _ = env.call_method(
-                    &activity,
-                    "requestFilePicker", // Ensure you update this method name in your Kotlin code!
-                    "(Ljava/lang/String;)V",
-                    &[(&j_key).into()]
-                );
-            }
-        }
-    }
-}
 
 // ============================================================================
 // APP STRUCTURES & STATE
@@ -139,6 +90,15 @@ impl Default for LoginForm {
     fn default() -> Self {
         Self { username: String::new(), password: String::new() }
     }
+}
+
+#[derive(Clone, PartialEq)]
+pub enum UiAction {
+    None,
+    Compute,
+    PickFile,
+    Save,
+    Close,
 }
 
 #[derive(Clone, PartialEq)]
@@ -619,16 +579,6 @@ impl SolageApp {
             }
         }
         
-        // --- 6. Android File Selection Queue ---
-        #[cfg(target_os = "android")]
-        if let Ok(mut queue) = crate::PENDING_FILE_SELECTIONS.lock() {
-            if !queue.is_empty() {
-                for (row_key, uri) in queue.drain(..) {
-                    self.update_user_value(&row_key, uri);
-                    needs_sync = true; // <-- ON LÈVE LE DRAPEAU
-                }
-            }
-        }
 
         // ====================================================================
         // LA LIGNE MAGIQUE DE SYNCHRONISATION
@@ -651,11 +601,11 @@ impl SolageApp {
     fn draw_android_safe_areas(&self, ctx: &egui::Context) {
         #[cfg(target_os = "android")]
         egui::TopBottomPanel::top("android_safe_area_top")
-            .frame(egui::Frame::none()).exact_height(45.0).show(ctx, |_ui| {});
+            .frame(egui::Frame::NONE).exact_height(45.0).show(ctx, |_ui| {});
 
         #[cfg(target_os = "android")]
         egui::TopBottomPanel::bottom("android_safe_area_bottom")
-            .frame(egui::Frame::none()).exact_height(35.0).show(ctx, |_ui| {});
+            .frame(egui::Frame::NONE).exact_height(35.0).show(ctx, |_ui| {});
     }
 
     fn draw_welcome_screen(&mut self, ctx: &egui::Context) {
@@ -712,10 +662,10 @@ impl SolageApp {
 
                 ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                     ui.horizontal(|ui| {
-                        let response = ui.add(egui::TextEdit::singleline(&mut self.url_input).desired_width(220.0));
+                        let _response = ui.add(egui::TextEdit::singleline(&mut self.url_input).desired_width(220.0));
                         
                         #[cfg(target_os = "android")]
-                        if response.clicked() {
+                        if _response.clicked() {
                             crate::request_android_text_input(&self.url_input, "url_input");
                         }
 
@@ -923,7 +873,7 @@ impl eframe::App for SolageApp {
             // 1. LES DRAPEAUX D'ACTION
             let mut action_save = false;
             let mut action_close = false;
-            let mut action_compute = false;
+            let mut ui_action = UiAction::None;
             
             // 2. LE BLOC D'EMPRUNT (Scope)
             // On enferme la lecture de `config` et le dessin de l'interface dans un bloc { }
@@ -1070,7 +1020,7 @@ impl eframe::App for SolageApp {
                                 
                                 egui::ComboBox::from_id_salt("flavor_cb")
                                     .selected_text(current_name)
-                                    .show_ui(ui, |ui| {
+                                    .show_ui(ui, |ui: &mut egui::Ui| {
                                         for (i, f) in active_mode.flavors.iter().enumerate() {
                                             ui.selectable_value(&mut self.state.nav.flavor, i, &f.name);
                                         }
@@ -1096,9 +1046,9 @@ impl eframe::App for SolageApp {
                                 let base_path = format!("{}/{}/{}", active_section.name, active_mode.name, active_flavor.name);
                                 
                                 if is_mobile {
-                                    action_compute = draw_single_step(ui, active_flavor, &base_path, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &mut self.state.nav, &self.resolved_values);
+                                    ui_action = draw_single_step(ui, active_flavor, &base_path, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &mut self.state.nav, &self.resolved_values);
                                 } else {
-                                    action_compute = draw_comparison_table(ui, active_flavor, &base_path, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &self.resolved_values);
+                                    ui_action = draw_comparison_table(ui, active_flavor, &base_path, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &self.resolved_values);
                                 }
                             }
                         }
@@ -1110,10 +1060,16 @@ impl eframe::App for SolageApp {
 
             // 4. L'EXÉCUTION DES DRAPEAUX
             // Maintenant que nous avons l'accès exclusif à `self`, on peut appeler nos méthodes.
-            if action_compute {
-                println!("action compute '{}'", action_compute);
-                self.recalculate_all_compute_rules();
+            match ui_action {
+                UiAction::Compute => self.recalculate_all_compute_rules(),
+                UiAction::PickFile => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.external_file_rx = Some(rx);
+                    self.backend.pick_file_async_mobile(tx);
+                }
+                _ => {}
             }
+
             if action_save {
                 self.save_current_project(ctx);
             }
@@ -1143,6 +1099,7 @@ impl eframe::App for SolageApp {
 // UI RENDERING HELPERS
 // ============================================================================
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn draw_splash_anim(ctx: &egui::Context, time: f64) {
     let fade_out = if time > 1.5 { (2.5 - time).clamp(0.0, 1.0) as f32 } else { 1.0 };
     
@@ -1187,15 +1144,15 @@ fn draw_single_step(
     pending_target: &mut Option<FileDialogTarget>,
     nav: &mut NavState,
     resolved_values: &std::collections::HashMap<String, String>,
-) -> bool {
-    let mut ui_changed = false;
+) -> UiAction {
+    let mut action = UiAction::None;
     
     // 1. LA DÉCLARATION EST ICI AUSSI
     let mut step_to_remove: Option<usize> = None;
     
     if flavor.steps.is_empty() {
         ui.colored_label(Color32::GRAY, "No steps defined");
-        return false;
+        return action;
     }
 
     let step_count = flavor.steps.len();
@@ -1210,7 +1167,7 @@ fn draw_single_step(
         ui.menu_button("...", |ui| {
             if ui.button("X Remove Step").clicked() {
                 step_to_remove = Some(current);
-                ui.close_menu();
+                ui.close();
             }
         });
 
@@ -1233,8 +1190,7 @@ fn draw_single_step(
         });
             
         let absolute_key = format!("{}/{}/{}", base_path, step.name, row_def.key);
-        let mut cell_changed = false;
-
+        
         let row_response = ui.horizontal(|ui| {
             ui.set_min_width(ui.available_width());
             
@@ -1263,7 +1219,7 @@ fn draw_single_step(
                 if is_reference {
                     if ui.button("🔗").on_hover_text("Cliquer pour casser le lien (Bake)").clicked() {
                         *value = display_val.clone();
-                        cell_changed = true;
+                        action = UiAction::Compute;
                     }
                 } else {
                     // CHANGEMENT D'ICÔNE : 🛠 si c'est local, ⚙ si c'est global
@@ -1290,7 +1246,7 @@ fn draw_single_step(
                         {
                             // Dès qu'on tape une lettre, on l'enregistre dans le STEP (Surcharge locale !)
                             step.computes.insert(row_def.key.clone(), script_to_edit);
-                            cell_changed = true;
+                            action = UiAction::Compute;
                         }
                         
                         ui.separator();
@@ -1299,8 +1255,8 @@ fn draw_single_step(
                             // Bouton pour détruire la surcharge et revenir au global
                             if ui.button("🗑 Supprimer la surcharge locale").clicked() {
                                 step.computes.remove(&row_def.key);
-                                cell_changed = true;
-                                ui.close_menu();
+                                action = UiAction::Compute;
+                                ui.close();
                             }
                         }
                     }).response.on_hover_text(if is_local_compute { "Modifier la surcharge" } else { "Créer une surcharge locale" });
@@ -1311,7 +1267,12 @@ fn draw_single_step(
                     .on_hover_text(tooltip_text);
                     
             } else {
-                cell_changed |= draw_cell_value(ui, value, &row_def.widget, &absolute_key, engine, file_dialog, pending_target);
+                let cell_action = draw_cell_value(ui, value, &row_def.widget, &absolute_key, engine, file_dialog, pending_target);
+                match cell_action {
+                    UiAction::PickFile => action = UiAction::PickFile,
+                    UiAction::Compute if !matches!(action, UiAction::PickFile) => action = UiAction::Compute,
+                    _ => {}
+                }
             }
         });
 
@@ -1329,11 +1290,7 @@ fn draw_single_step(
 
         if let Some(dropped_value) = drop_zone.dnd_release_payload::<std::sync::Arc<String>>() {
             *value = dropped_value.to_string();
-            cell_changed = true;
-        }
-
-        if cell_changed {
-            ui_changed = true;
+            action = UiAction::Compute;
         }
     }
 
@@ -1343,10 +1300,10 @@ fn draw_single_step(
         if nav.step >= flavor.steps.len() && nav.step > 0 {
             nav.step -= 1;
         }
-        ui_changed = true;
+        action = UiAction::Compute;
     }
 
-    ui_changed
+    action
 }
 
 fn draw_comparison_table(
@@ -1358,8 +1315,8 @@ fn draw_comparison_table(
     file_dialog: &mut egui_file_dialog::FileDialog,
     pending_target: &mut Option<FileDialogTarget>,
     resolved_values: &std::collections::HashMap<String, String>,
-) -> bool {
-    let mut ui_changed = false;
+) -> UiAction {
+    let mut action = UiAction::None;
     
     // 1. LA DÉCLARATION EST ICI : Tout en haut, visible par toute la fonction !
     let mut step_to_remove: Option<usize> = None;
@@ -1367,7 +1324,7 @@ fn draw_comparison_table(
 
     if flavor.steps.is_empty() {
         ui.colored_label(Color32::GRAY, "No steps defined");
-        return false;
+        return action;
     }
 
     let mut builder = TableBuilder::new(ui)
@@ -1408,7 +1365,7 @@ fn draw_comparison_table(
                         ui.menu_button("...", |ui| {
                             if ui.button("X Remove Step").clicked() {
                                 step_to_remove = Some(step_idx);
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                     }).response;
@@ -1453,7 +1410,6 @@ fn draw_comparison_table(
                             });
 
                             let absolute_key = format!("{}/{}/{}", base_path, step.name, row_def.key);
-                            let mut cell_changed = false;
 
                             // B. ON DESSINE LA CELLULE (Poignée + Widget)
                             let cell_response = ui.horizontal(|ui| {
@@ -1485,7 +1441,7 @@ fn draw_comparison_table(
                                     if is_reference {
                                         if ui.button("🔗").on_hover_text("Cliquer pour casser le lien (Bake)").clicked() {
                                             *value = display_val.clone();
-                                            cell_changed = true;
+                                            action = UiAction::Compute;
                                         }
                                     } else {
                                         // CHANGEMENT D'ICÔNE : 🛠 si c'est local, ⚙ si c'est global
@@ -1512,7 +1468,7 @@ fn draw_comparison_table(
                                             {
                                                 // Dès qu'on tape une lettre, on l'enregistre dans le STEP (Surcharge locale !)
                                                 step.computes.insert(row_def.key.clone(), script_to_edit);
-                                                cell_changed = true;
+                                                action = UiAction::Compute;
                                             }
                                             
                                             ui.separator();
@@ -1521,8 +1477,8 @@ fn draw_comparison_table(
                                                 // Bouton pour détruire la surcharge et revenir au global
                                                 if ui.button("🗑 Supprimer la surcharge locale").clicked() {
                                                     step.computes.remove(&row_def.key);
-                                                    cell_changed = true;
-                                                    ui.close_menu();
+                                                    action = UiAction::Compute;
+                                                    ui.close();
                                                 }
                                             }
                                         }).response.on_hover_text(if is_local_compute { "Modifier la surcharge" } else { "Créer une surcharge locale" });
@@ -1533,7 +1489,12 @@ fn draw_comparison_table(
                                         .on_hover_text(tooltip_text);
                                         
                                 } else {
-                                    cell_changed |= draw_cell_value(ui, value, &row_def.widget, &absolute_key, engine, file_dialog, pending_target);
+                                    let cell_action = draw_cell_value(ui, value, &row_def.widget, &absolute_key, engine, file_dialog, pending_target);
+                                    match cell_action {
+                                        UiAction::PickFile => action = UiAction::PickFile,
+                                        UiAction::Compute if !matches!(action, UiAction::PickFile) => action = UiAction::Compute,
+                                        _ => {}
+                                    }
                                 }
                             });
 
@@ -1563,11 +1524,7 @@ fn draw_comparison_table(
                                 } else {
                                     *value = source_value.clone();        // On copie purement
                                 }
-                                cell_changed = true;
-                            }
-
-                            if cell_changed {
-                                ui_changed = true;
+                                action = UiAction::Compute;
                             }
                         }); // Fin de la colonne (strip.col)
                     } // Fin de la boucle des steps
@@ -1578,7 +1535,7 @@ fn draw_comparison_table(
     // 3. LA SUPPRESSION : Tout en bas
     if let Some(idx) = step_to_remove {
         flavor.steps.remove(idx);
-        ui_changed = true;
+        action = UiAction::Compute;
     }
 
     if let Some((from_idx, to_idx)) = step_to_move {
@@ -1591,11 +1548,11 @@ fn draw_comparison_table(
             
             // On lève le drapeau pour que Rhai recalcule tout, car les variables absolues
             // ont changé de nom (Step 1 est devenu Step 2, etc.) !
-            ui_changed = true; 
+            action = UiAction::Compute; 
         }
     }
     
-    ui_changed
+    action
 }
 
 // ============================================================================
@@ -1607,13 +1564,12 @@ fn draw_cell_value(
     value: &mut String,
     widget: &WidgetDef,
     row_key: &str,
-    _engine: &ScriptEngine,
-    file_dialog: &mut egui_file_dialog::FileDialog,
-    pending_target: &mut Option<FileDialogTarget>,
-) -> bool {
-    let mut value_has_changed = false;
+        _engine: &ScriptEngine, 
+        file_dialog: &mut egui_file_dialog::FileDialog,
+        pending_target: &mut Option<FileDialogTarget>,) -> UiAction {
+    let mut action = UiAction::None;
 
-    let mut handle_text_edit = |ui: &mut egui::Ui, val: &mut String| {
+    let handle_text_edit = |ui: &mut egui::Ui, val: &mut String| {
         let response = ui.text_edit_singleline(val);
         
         #[cfg(target_os = "android")]
@@ -1654,7 +1610,7 @@ fn draw_cell_value(
             match widget.widget_type {
                 SolageWidget::Text => { 
                     if handle_text_edit(ui, value).changed() {
-                        value_has_changed = true;
+                        action = UiAction::Compute;
                     }
                 },
                 SolageWidget::Number => {
@@ -1676,12 +1632,12 @@ fn draw_cell_value(
 
                     if let Some(min) = widget.min {
                         if let Some(max) = widget.max {
-                            drag = drag.clamp_range(min..=max);
+                            drag = drag.range(min..=max);
                         } else {
-                            drag = drag.clamp_range(min..=f32::INFINITY);
+                            drag = drag.range(min..=f32::INFINITY);
                         }
                     } else if let Some(max) = widget.max {
-                        drag = drag.clamp_range(f32::NEG_INFINITY..=max);
+                        drag = drag.range(f32::NEG_INFINITY..=max);
                     }
 
                     let drag_response = ui.add(drag);
@@ -1692,7 +1648,7 @@ fn draw_cell_value(
                         } else {
                             *value = num.to_string();
                         }
-                        value_has_changed = true;
+                        action = UiAction::Compute;
                     }
 
                     #[cfg(target_os = "android")]
@@ -1707,7 +1663,7 @@ fn draw_cell_value(
 
                     if ui.add(egui::Slider::new(&mut num, min..=max)).changed() {
                         *value = num.to_string();
-                        value_has_changed = true;
+                        action = UiAction::Compute;
                     }
                 },
                 SolageWidget::Bool | SolageWidget::Checkbox => {
@@ -1715,18 +1671,19 @@ fn draw_cell_value(
                     
                     if ui.checkbox(&mut is_checked, "").changed() {
                         *value = is_checked.to_string();
-                        value_has_changed = true; 
+                        action = UiAction::Compute;
                     }
                 },
                 SolageWidget::Path => {
                     handle_text_edit(ui, value);
                     
-                    #[cfg(not(target_arch = "wasm32"))]
-                    if ui.button("Browse...").clicked() { 
+                    if ui.button("Browse...").clicked() {
                         #[cfg(target_os = "android")]
-                        crate::request_android_file_picker(row_key);
+                        {
+                            action = UiAction::PickFile;
+                        }
                         
-                        #[cfg(not(target_os = "android"))]
+                        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
                         {
                             *pending_target = Some(FileDialogTarget::WidgetPath(row_key.to_string()));
                             file_dialog.pick_file(); 
@@ -1737,12 +1694,12 @@ fn draw_cell_value(
                     let options = widget.options.as_ref().map_or(vec![], |o| o.clone());
                     let current_display = if value.is_empty() { "Select..." } else { value.as_str() };
 
-                    egui::ComboBox::from_id_source(row_key)
+                    egui::ComboBox::from_id_salt(row_key)
                         .selected_text(current_display)
-                        .show_ui(ui, |ui| {
+                        .show_ui(ui, |ui: &mut egui::Ui| {
                             for opt in options {
                                 if ui.selectable_value(value, opt.clone(), &opt).clicked() {
-                                    value_has_changed = true;
+                                    action = UiAction::Compute;
                                 }
                             }
                         });
@@ -1755,18 +1712,16 @@ fn draw_cell_value(
         }
     });
 
-    value_has_changed
+    action
 }
 
 // ============================================================================
 // SYSTEM UTILITIES
 // ============================================================================
 
-fn update_widget_value(state: &mut AppState, target_key: &str, new_value: String) {
-    state.user_values.insert(target_key.to_string(), new_value);
-}
 
-fn apply_defaults(config: &AppConfig, state: &mut AppState) {
+
+fn apply_defaults(_config: &AppConfig, state: &mut AppState) {
     state.nav.section = 0;
     state.nav.mode = 0;
     state.nav.flavor = 0;
