@@ -52,6 +52,19 @@ pub struct RowDef {
     pub widget: WidgetDef,
 }
 
+impl RowDef {
+    pub fn new(key: impl Into<String>, label: impl Into<String>, widget_type: WidgetType) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+            widget: WidgetDef {
+                widget_type,
+                ..Default::default()
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -62,10 +75,23 @@ pub struct Step {
     pub computes: std::collections::HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FlavorView {
+    #[default]
+    ComparisonTable,
+    Feed,
+    SingleStep,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Flavor {
     pub name: String,
+    #[serde(default)]
+    pub view: FlavorView,
+    #[serde(default)]
+    pub mobile_view: Option<FlavorView>,
     pub row_definitions: Vec<RowDef>,
     #[serde(default)]
     pub steps: Vec<Step>,

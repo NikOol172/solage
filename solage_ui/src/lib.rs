@@ -7,14 +7,14 @@ use std::collections::{HashMap, HashSet}; // Added HashSet for rehydration
 use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 
-use solage_data::{AppConfig, NavState, WidgetDef, Flavor, Step, AppState, GlobalPreferences, WidgetType as SolageWidget}; 
+use solage_data::{AppConfig, NavState, WidgetDef, Flavor, Step, AppState, GlobalPreferences, WidgetType as SolageWidget, FlavorView, Section, Mode, RowDef};
 use solage_core::{ScriptEngine, PlatformBackend, ScriptContext, AuthProvider, AuthState, load_config, load_state, save_state, save_preferences, load_preferences};
 
 // ============================================================================
 // ANDROID JNI BRIDGE & ASYNC QUEUES
 // ============================================================================
 
-/// Queue for pending text inputs received from Android's native UI
+// Queue for pending text inputs received from Android's native UI
 pub static PENDING_TEXT_INPUTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// Callback triggered by Android when the user confirms text input
@@ -122,6 +122,7 @@ pub struct SolageApp {
     current_config_path: Option<PathBuf>,
     prefs_path: String,
     pub url_input: String,
+    pub feed_input: String,
     pub download_rx: Option<Receiver<Result<String, String>>>,
     pub file_load_rx: Option<Receiver<PathBuf>>,
     pub external_file_rx: Option<std::sync::mpsc::Receiver<(String, String)>>,
@@ -143,14 +144,14 @@ impl SolageApp {
         auth: Box<dyn AuthProvider>,
     ) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
-
+        
         let prefs_path = backend.get_config_dir().join("user_prefs.json");
         let preferences = load_preferences(prefs_path.to_str().unwrap_or("user_prefs.json"))
-            .unwrap_or_default();
-
-        let default_url = backend.default_url().unwrap_or_default();
-
-        Self {
+        .unwrap_or_default();
+    
+    let default_url = backend.default_url().unwrap_or_default();
+    
+    Self {
             backend,
             auth,
             engine: ScriptEngine::new(),
@@ -160,6 +161,7 @@ impl SolageApp {
             current_config_path: None,
             prefs_path: prefs_path.to_string_lossy().to_string(),
             url_input: default_url,
+            feed_input: String::new(),
             download_rx: None,
             file_load_rx: None,
             external_file_rx: None,
@@ -172,7 +174,7 @@ impl SolageApp {
             resolved_values: HashMap::new()
         }
     }
-
+    
     // ========================================================================
     // DATA LOADING & IO METHODS
     // ========================================================================
@@ -676,6 +678,12 @@ impl SolageApp {
                     });
                 });
 
+                ui.add_space(20.0);
+                if ui.button("⚠️ Run Stress Test").clicked() {
+                    self.config = Some(generate_stress_test_config());
+                    self.recalculate_all_compute_rules();
+                }
+
                 if !self.preferences.recent_files.is_empty() {
                     ui.add_space(30.0);
                     ui.separator();
@@ -873,6 +881,7 @@ impl eframe::App for SolageApp {
             // 1. LES DRAPEAUX D'ACTION
             let mut action_save = false;
             let mut action_close = false;
+            let mut action_stress_test = false;
             let mut ui_action = UiAction::None;
             
             // 2. LE BLOC D'EMPRUNT (Scope)
@@ -989,6 +998,12 @@ impl eframe::App for SolageApp {
                                 });
                             }
                         }
+
+                        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                            if ui.button("⚠️ Run Stress Test").clicked() {
+                                action_stress_test = true;
+                            }
+                        });
                     });
                 }
 
@@ -1000,44 +1015,53 @@ impl eframe::App for SolageApp {
 
                     let section_idx = self.state.nav.section;
                     if let Some(active_section) = config.sections.get_mut(section_idx) {
-                        ui.horizontal(|ui| {
-                            for (mode_idx, mode) in active_section.modes.iter().enumerate() {
-                                let is_selected = self.state.nav.mode == mode_idx;
-                                if ui.selectable_label(is_selected, &mode.name).clicked() {
-                                    self.state.nav.mode = mode_idx;
-                                    self.state.nav.flavor = 0;
+                        if active_section.modes.len() > 1 {
+                            ui.horizontal(|ui| {
+                                for (mode_idx, mode) in active_section.modes.iter().enumerate() {
+                                    let is_selected = self.state.nav.mode == mode_idx;
+                                    if ui.selectable_label(is_selected, &mode.name).clicked() {
+                                        self.state.nav.mode = mode_idx;
+                                        self.state.nav.flavor = 0;
+                                    }
                                 }
-                            }
-                        });
-                        ui.separator();
+                            });
+                            ui.separator();
+                        }
 
                         let mode_idx = self.state.nav.mode;
                         if let Some(active_mode) = active_section.modes.get_mut(mode_idx) {
                             ui.horizontal(|ui| {
-                                ui.label("Flavor:");
-                                let flavor_idx = self.state.nav.flavor;
-                                let current_name = active_mode.flavors.get(flavor_idx).map(|f| f.name.clone()).unwrap_or_default();
-                                
-                                egui::ComboBox::from_id_salt("flavor_cb")
-                                    .selected_text(current_name)
-                                    .show_ui(ui, |ui: &mut egui::Ui| {
-                                        for (i, f) in active_mode.flavors.iter().enumerate() {
-                                            ui.selectable_value(&mut self.state.nav.flavor, i, &f.name);
-                                        }
-                                    });
+                                if active_mode.flavors.len() > 1 {
+                                    ui.label("Flavor:");
+                                    let flavor_idx = self.state.nav.flavor;
+                                    let current_name = active_mode.flavors.get(flavor_idx).map(|f| f.name.clone()).unwrap_or_default();
+                                    
+                                    egui::ComboBox::from_id_salt("flavor_cb")
+                                        .selected_text(current_name)
+                                        .show_ui(ui, |ui: &mut egui::Ui| {
+                                            for (i, f) in active_mode.flavors.iter().enumerate() {
+                                                ui.selectable_value(&mut self.state.nav.flavor, i, &f.name);
+                                            }
+                                        });
+                                }
 
                                 if let Some(active_flavor) = active_mode.flavors.get_mut(self.state.nav.flavor) {
                                     ui.add_space(15.0); // Un petit espace visuel
                                     
-                                    if ui.button("➕ Add Step").clicked() {
+                                    let is_feed_view = if is_mobile {
+                                        matches!(active_flavor.mobile_view.as_ref().unwrap_or(&FlavorView::SingleStep), FlavorView::Feed)
+                                    } else {
+                                        matches!(active_flavor.view, FlavorView::Feed)
+                                    };
+
+                                    if !is_feed_view && ui.button("➕ Add Step").clicked() {
                                         let new_index = active_flavor.steps.len() + 1;
-                                        active_flavor.steps.push(Step {
+                                        active_flavor.steps.insert(0, Step {
                                             name: format!("Step {}", new_index),
                                             values: std::collections::HashMap::new(),
                                             computes: std::collections::HashMap::new(),
                                         });
                                     }
-
                                 }
                             }); 
                             
@@ -1045,10 +1069,22 @@ impl eframe::App for SolageApp {
                             if let Some(active_flavor) = active_mode.flavors.get_mut(flavor_idx) {
                                 let base_path = format!("{}/{}/{}", active_section.name, active_mode.name, active_flavor.name);
                                 
-                                if is_mobile {
-                                    ui_action = draw_single_step(ui, active_flavor, &base_path, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &mut self.state.nav, &self.resolved_values);
+                                let active_view = if is_mobile {
+                                    active_flavor.mobile_view.as_ref().unwrap_or(&FlavorView::SingleStep)
                                 } else {
-                                    ui_action = draw_comparison_table(ui, active_flavor, &base_path, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &self.resolved_values);
+                                    &active_flavor.view
+                                };
+
+                                match active_view {
+                                    FlavorView::ComparisonTable => {
+                                        ui_action = draw_comparison_table(ui, active_flavor, &base_path, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &self.resolved_values);
+                                    },
+                                    FlavorView::Feed => {
+                                        ui_action = draw_feed(ui, active_flavor, &base_path, &mut self.feed_input, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &self.resolved_values);
+                                    },
+                                    FlavorView::SingleStep => {
+                                        ui_action = draw_single_step(ui, active_flavor, &base_path, &mut script_context, &self.engine, &mut self.file_dialog, &mut self.pending_file_target, &mut self.state.nav, &self.resolved_values);
+                                    }
                                 }
                             }
                         }
@@ -1078,6 +1114,10 @@ impl eframe::App for SolageApp {
                     cfg.sections.clear();
                 }
                 self.current_config_path = None;
+            }
+            if action_stress_test {
+                self.config = Some(generate_stress_test_config());
+                self.recalculate_all_compute_rules();
             }
         }
 
@@ -1302,6 +1342,102 @@ fn draw_single_step(
         }
         action = UiAction::Compute;
     }
+
+    action
+}
+
+fn draw_feed(
+    ui: &mut Ui,
+    flavor: &mut Flavor,
+    base_path: &str,
+    feed_input: &mut String,
+    _script_context: &mut ScriptContext,
+    _engine: &ScriptEngine,
+    _file_dialog: &mut egui_file_dialog::FileDialog,
+    _pending_target: &mut Option<FileDialogTarget>,
+    resolved_values: &std::collections::HashMap<String, String>,
+) -> UiAction {
+    let mut action = UiAction::None;
+
+    let response = ui.add(
+        egui::TextEdit::singleline(feed_input)
+            .hint_text("Type a message and press Enter...")
+            .desired_width(ui.available_width())
+    );
+
+    // Put a button over the right side of the text edit
+    let mut send_clicked = false;
+    let btn_rect = egui::Rect::from_min_max(
+        egui::pos2(response.rect.max.x - 32.0, response.rect.min.y + 2.0),
+        egui::pos2(response.rect.max.x - 2.0, response.rect.max.y - 2.0),
+    );
+    
+    if ui.put(btn_rect, egui::Button::new("➤").frame(false)).clicked() {
+        send_clicked = true;
+    }
+
+    if send_clicked || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+        if !feed_input.is_empty() {
+            flavor.steps.insert(0, Step {
+                name: feed_input.clone(),
+                values: std::collections::HashMap::new(),
+                computes: std::collections::HashMap::new(),
+            });
+            feed_input.clear();
+            action = UiAction::Compute;
+            response.request_focus();
+        }
+    }
+    ui.separator();
+    
+    if flavor.steps.is_empty() {
+        ui.colored_label(Color32::GRAY, "No steps defined");
+        return action;
+    }
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for step in &mut flavor.steps {
+            ui.group(|ui|{
+                ui.horizontal(|ui| {
+                    ui.strong(RichText::new(&step.name).size(16.0).color(Color32::from_rgb(100, 180, 255)));
+                });
+                ui.separator();
+
+                for row_def in &flavor.row_definitions {
+                    let value = step.values.get(&row_def.key).cloned().unwrap_or_else(|| {
+                        row_def.widget.default.as_ref().map(|d| match d {
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Number(n) => n.to_string(),
+                            serde_json::Value::Bool(b) => b.to_string(),
+                            _ => String::new(),
+                        }).unwrap_or_default()
+                    });
+                        
+                    let absolute_key = format!("{}/{}/{}", base_path, step.name, row_def.key);
+                    
+                    let is_reference = value.starts_with('=');
+                    let is_local_compute = step.computes.contains_key(&row_def.key);
+                    let has_global_compute = row_def.widget.compute.is_some();
+                    let has_compute = is_local_compute || has_global_compute;
+
+                    let display_val = if is_reference || has_compute {
+                        if is_reference {
+                            resolved_values.get(&absolute_key).cloned().unwrap_or_else(|| "0".to_string())
+                        } else {
+                            value.clone()
+                        }
+                    } else {
+                        value.clone()
+                    };
+                    
+                    ui.horizontal(|ui| {
+                        ui.label(&row_def.label);
+                        ui.strong(egui::RichText::new(&display_val).color(egui::Color32::from_rgb(100, 180, 255)));
+                    });
+                }
+            });
+        }
+    });
 
     action
 }
@@ -1719,7 +1855,54 @@ fn draw_cell_value(
 // SYSTEM UTILITIES
 // ============================================================================
 
+pub fn generate_stress_test_config() -> AppConfig {
+    let mut section = Section {
+        name: "Projets".to_string(),
+        icon: "🎬".to_string(),
+        modes: vec![],
+    };
 
+    let mut mode = Mode {
+        name: "STRESS_TEST_PROJ".to_string(),
+        flavors: vec![],
+    };
+
+    let mut flavor = Flavor {
+        name: "SQ_LOAD_TEST".to_string(),
+        view: FlavorView::ComparisonTable, // Utilise l'enum corrigé
+        mobile_view: Some(FlavorView::SingleStep),
+        row_definitions: vec![
+            RowDef::new("status", "Status", SolageWidget::Text),
+            RowDef::new("priority", "Urgence", SolageWidget::Number),
+            RowDef::new("complexity", "Complexité", SolageWidget::Number),
+        ],
+        steps: vec![],
+    };
+
+    // Génération de 100 plans
+    for i in 1..=100 {
+        let mut values = HashMap::new();
+        values.insert("status".to_string(), "WIP".to_string());
+        values.insert("priority".to_string(), (i % 5).to_string());
+        values.insert("complexity".to_string(), "3".to_string());
+
+        flavor.steps.push(Step {
+            name: format!("SH{:04}", i * 10),
+            values,
+            computes: HashMap::new(),
+        });
+    }
+
+    mode.flavors.push(flavor);
+    section.modes.push(mode);
+
+    AppConfig {
+        title: "Stress Test Solage".to_string(),
+        version: "1.0.0".to_string(),
+        actions: vec![],
+        sections: vec![section],
+    }
+}
 
 fn apply_defaults(_config: &AppConfig, state: &mut AppState) {
     state.nav.section = 0;

@@ -11,7 +11,7 @@ struct WebBackend;
 #[cfg(target_arch = "wasm32")]
 impl PlatformBackend for WebBackend {
     fn save_file(&self, _path: &PathBuf, _content: &str) -> Result<(), String> {
-        Err("Non supporté".to_string())
+        Err("Not supported".to_string())
     }
     fn launch_external(&self, _cmd: &str, _args: &[&str]) -> Result<(), String> { Ok(()) }
     fn get_config_dir(&self) -> PathBuf { PathBuf::from("/local_storage") }
@@ -24,7 +24,7 @@ pub fn main() {
     #[cfg(target_arch = "wasm32")]
     {
         eframe::WebLogger::init(log::LevelFilter::Debug).ok();
-        log::info!("🚀 Solage Web démarrage...");
+        log::info!("🚀 Solage Web starting...");
 
         let web_options = eframe::WebOptions::default();
 
@@ -45,7 +45,7 @@ pub fn main() {
                 .await;
 
             if let Err(e) = start_result {
-                log::error!("Erreur au lancement d'eframe: {:?}", e);
+                log::error!("Error starting eframe: {:?}", e);
             }
         });
     }

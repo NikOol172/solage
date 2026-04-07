@@ -7,7 +7,7 @@ use std::sync::mpsc::Sender;
 #[cfg(target_os = "android")]
 use android_activity::AndroidApp;
 
-// NOUVEAU : Une variable globale pour stocker notre canal le temps que l'utilisateur choisisse son fichier
+// NEW: A global variable to store our channel while the user chooses their file
 #[allow(dead_code)]
 static FILE_SENDER: Mutex<Option<Sender<(String, String)>>> = Mutex::new(None);
 
@@ -15,13 +15,13 @@ static FILE_SENDER: Mutex<Option<Sender<(String, String)>>> = Mutex::new(None);
 struct MobileBackend {
     data_dir: PathBuf,
     #[cfg(target_os = "android")]
-    app: AndroidApp, // NOUVEAU : On garde une référence à l'application Android pour le JNI
+    app: AndroidApp, // NEW: We keep a reference to the Android application for the JNI
 }
 
 impl PlatformBackend for MobileBackend {
 
     fn save_file(&self, _path: &PathBuf, _content: &str) -> Result<(), String> {
-        Err("Non supporté en accès direct".to_string())
+        Err("Not supported for direct access".to_string())
     }
 
     fn launch_external(&self, _cmd: &str, _args: &[&str]) -> Result<(), String> {
@@ -32,20 +32,20 @@ impl PlatformBackend for MobileBackend {
         self.data_dir.clone()
     }
 
-    // NOUVEAU : L'implémentation asynchrone mobile !
+    // NEW: The mobile asynchronous implementation!
     fn pick_file_async_mobile(&self, tx: std::sync::mpsc::Sender<(String, String)>) {
         #[cfg(target_os = "android")]
         {
-            // 1. On sauvegarde l'émetteur (tx) pour la réponse de Java
+            // 1. We save the sender (tx) for the response from Java
             if let Ok(mut sender_guard) = FILE_SENDER.lock() {
                 *sender_guard = Some(tx);
             }
 
-            // 2. On récupère l'environnement JNI
+            // 2. We get the JNI environment
             let vm_ptr = self.app.vm_as_ptr() as *mut jni::sys::JavaVM;
             let activity_ptr = self.app.activity_as_ptr() as jni::sys::jobject;
 
-            // 3. On appelle la méthode "openFilePicker" sur notre MainActivity Java/Kotlin
+            // 3. We call the "openFilePicker" method on our MainActivity Java/Kotlin
             unsafe {
                 if let Ok(jvm) = jni::JavaVM::from_raw(vm_ptr) {
                     if let Ok(mut env) = jvm.attach_current_thread() {
@@ -55,7 +55,7 @@ impl PlatformBackend for MobileBackend {
                         let _ = env.call_method(
                             activity_obj,
                             "openFilePicker",
-                            "()V", // "V" signifie que la fonction Java retourne void (rien)
+                            "()V", // "V" means the Java function returns void (nothing)
                             &[]
                         );
                     }
@@ -65,16 +65,16 @@ impl PlatformBackend for MobileBackend {
     }
 }
 
-// --- CALLBACK JNI : Fonction appelée par Android/Java une fois le fichier sélectionné ---
-// On importe le Mutex global depuis l'UI
+// --- JNI CALLBACK: Function called by Android/Java once the file is selected ---
+// We import the global Mutex from the UI
 use solage_ui::PENDING_TEXT_INPUTS;
 
-// --- CALLBACK 1 : SÉLECTION DE FICHIER ---
+// --- CALLBACK 1: FILE SELECTION ---
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_cloudcompositing_solage_MainActivity_onFileSelected(
     mut env: jni::JNIEnv,
-    _this: jni::objects::JObject, // <-- CORRIGÉ : JObject pour correspondre à l'instance
+    _this: jni::objects::JObject, // <-- FIXED: JObject to match the instance
     name: jni::objects::JString,
     content: jni::objects::JString,
 ) {
@@ -90,12 +90,12 @@ pub extern "system" fn Java_com_cloudcompositing_solage_MainActivity_onFileSelec
     }
 }
 
-// --- CALLBACK 2 : SAISIE DE TEXTE ---
+// --- CALLBACK 2: TEXT INPUT ---
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_cloudcompositing_solage_MainActivity_onTextEntered(
     mut env: jni::JNIEnv,
-    _this: jni::objects::JObject, // <-- PARFAIT : JObject
+    _this: jni::objects::JObject, // <-- PERFECT: JObject
     j_row_key: jni::objects::JString,
     j_text: jni::objects::JString,
 ) {
@@ -109,7 +109,7 @@ pub extern "system" fn Java_com_cloudcompositing_solage_MainActivity_onTextEnter
     }
 }
 
-// --- POINT D'ENTRÉE ANDROID ---
+// --- ANDROID ENTRY POINT ---
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
@@ -121,7 +121,7 @@ fn android_main(app: AndroidApp) {
             .with_tag("SOLAGE")
     );
     
-    log::info!("=== SOLAGE ANDROID DÉMARRAGE ===");
+    log::info!("=== SOLAGE ANDROID STARTING ===");
 
     let data_dir = app.internal_data_path().unwrap_or_else(|| PathBuf::from("/data/local/tmp"));
 
@@ -134,7 +134,7 @@ fn android_main(app: AndroidApp) {
         "Solage Mobile",
         options,
         Box::new(move |cc| {
-            // NOUVEAU : On passe l'app (qui contient le pointeur JNI) au Backend
+            // NEW: We pass the app (which contains the JNI pointer) to the Backend
             let backend = MobileBackend { data_dir, app: app.clone() };
             let solage_app = SolageApp::new(cc, Box::new(backend), Box::new(NoAuth::new()));
             Ok(Box::new(solage_app))
