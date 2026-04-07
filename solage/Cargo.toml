@@ -1,0 +1,13 @@
+[package]
+name = "solage"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+async-rt = ["solage_ui/async-rt"]
+
+[dependencies]
+solage_core = { path = "../solage_core" }
+solage_data = { path = "../solage_data" }
+solage_ui = { path = "../solage_ui" }
